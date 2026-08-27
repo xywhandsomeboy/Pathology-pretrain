@@ -1,0 +1,76 @@
+MODEL:
+  WEIGHTS: ''
+compute_precision:
+  grad_scaler: true
+  student:
+    gcn:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    pool_gate:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    classifier:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+train:
+  batch_size_per_gpu: 2
+  dataset_path: ImageNet:split=TRAIN
+  output_dir: .
+  saveckp_freq: 20
+  seed: 0
+  num_workers: 10
+  OFFICIAL_EPOCH_LENGTH: 72 #1938
+  cache_dataset: true
+  centering: "centering" # or "sinkhorn_knopp"
+  table: "/home/li_yu/Proj04_he/Code/datasets/finetune_csv/hospital-TCGA/TCGA_train_split.csv"
+  jsonfile: "/home/li_yu/Proj04_he/Code/datasets/finetune_csv/TCGA-CESC/TCGA-CESC2.json"
+  # Weighted sampling for imbalanced classes
+  use_weighted_sampling: true  # Enable weighted sampling based on class frequencies
+  weighted_sampling_mode: "balanced"  # Options: "balanced", "inverse", "sqrt_inverse"
+  use_class_weighted_loss: false
+  freeze_gnn_layers: 0
+  classifier_dropout: 0.2
+  collapse_penalty_weight: 0.02
+eval:
+  table: "/home/li_yu/Proj04_he/Code/datasets/finetune_csv/hospital-TCGA/TCGA_val_split.csv"
+student:
+  momentum: 0.992
+  final_momentum: 1
+gcn:
+  arch: 'gnn'
+  pretrained_weights: '/home/li_yu/Proj04_he/done_work/dinov2_stage2_2_FmH2ST/dinov2/results/gcn_1112_pretrain_embeddings-1024-b4-mask75/eval/training_48799/student_checkpoint.pth'
+  num_layer: 5
+  emb_dim: 1024
+  JK: "sum"
+  edge_dim: 1
+  dropout_ratio: 0.3
+  gnn_type: "gat"
+  block_chunks: 1
+  use_residual: true
+  use_layernorm: true
+optim:
+  epochs: 400
+  weight_decay: 0.04
+  weight_decay_end: 0.4
+  base_lr: 0.001  # learning rate for a batch size of 1024
+  lr: 0.  # will be set after applying scaling rule
+  warmup_epochs: 5
+  min_lr: 1.0e-06
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0
+  scaling_rule: sqrt_wrt_1024
+  patch_embed_lr_mult: 1.0
+  layerwise_decay: 1.0
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+evaluation:
+  eval_period_iterations: 72 #1938

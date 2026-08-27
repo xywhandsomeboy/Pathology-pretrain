@@ -1,0 +1,21 @@
+# ===== 数据与权重（体积过大，未纳入版本控制，详见 README 第 6 节完整目录树）=====
+/Data/
+/Graph/
+/UNI/
+
+# 训练产物（权重 / 日志 / checkpoint）
+**/results/
+
+# Python 虚拟环境
+**/.venv/
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# 安装包与任务日志
+*.whl
+Job.*.out
+Job.*.err

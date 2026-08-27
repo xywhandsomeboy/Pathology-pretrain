@@ -1,0 +1,68 @@
+MODEL:
+  WEIGHTS: ''
+compute_precision:
+  grad_scaler: true
+  student:
+    gcn:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    pool_gate:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    linear_pred_edges:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+train:
+  batch_size_per_gpu: 2
+  dataset_path: ImageNet:split=TRAIN
+  output_dir: .
+  saveckp_freq: 20
+  seed: 0
+  num_workers: 10
+  OFFICIAL_EPOCH_LENGTH: 122 #1938
+  cache_dataset: true
+  centering: "centering" # or "sinkhorn_knopp"
+student:
+  momentum: 0.992
+  final_momentum: 1
+gcn:
+  arch: 'gnn'
+  pretrained_weights: ''
+  num_layer: 5
+  emb_dim: 1024
+  JK: "sum"
+  edge_dim: 1
+  dropout_ratio: 0
+  gnn_type: "gat"
+  block_chunks: 1
+  use_residual: true
+  use_layernorm: true
+  mask_strategy: "edge"  # "node" 
+  structure_loss_weight: 0.02
+  graph_consistency_weight: 0.2
+optim:
+  epochs: 400
+  weight_decay: 0.04
+  weight_decay_end: 0.4
+  base_lr: 0.004  # learning rate for a batch size of 1024
+  lr: 0.  # will be set after applying scaling rule
+  warmup_epochs: 10
+  min_lr: 1.0e-06
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 1
+  scaling_rule: sqrt_wrt_1024
+  patch_embed_lr_mult: 0.2
+  layerwise_decay: 0.9
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+evaluation:
+  eval_period_iterations: 122 #1938
