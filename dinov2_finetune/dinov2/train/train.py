@@ -113,15 +113,16 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 
 
 def do_test(cfg, model, iteration):
-    new_state_dict = model.teacher.state_dict()
+    # teacher 已移除，保存 student（含 GNN 及各预测头）的权重用于评估
+    new_state_dict = model.student.state_dict()
 
     if distributed.is_main_process():
         iterstring = str(iteration)
         eval_dir = os.path.join(cfg.train.output_dir, "eval", iterstring)
         os.makedirs(eval_dir, exist_ok=True)
-        # save teacher checkpoint
-        teacher_ckp_path = os.path.join(eval_dir, "teacher_checkpoint.pth")
-        torch.save({"teacher": new_state_dict}, teacher_ckp_path)
+        # save student checkpoint
+        student_ckp_path = os.path.join(eval_dir, "student_checkpoint.pth")
+        torch.save({"student": new_state_dict}, student_ckp_path)
 
 
 def do_train(cfg, model, resume=False):

@@ -33,7 +33,25 @@ compute_precision:
         param_dtype: fp32
         reduce_dtype: fp32
         buffer_dtype: fp32
-    linear_pred_edges:
+    spatial_agg:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    projection:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    edge_existence_head:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    edge_type_head:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp32
@@ -90,6 +108,27 @@ gcn:
   JK: "last"
   dropout_ratio: 0
   gnn_type: "gat"
+  # 修改1：子图 patch 特征的空间感知聚合（1x1压缩 + 多尺度DepthwiseConv + 池化）
+  spatial_agg_hidden: 256
+  spatial_agg_pool_size: 4
+  # 修改3.2：初始空间图仅根据 WSI 坐标构建（邻接半径）
+  spatial_radius: 50.0
+  # 修改3出口：context-aware 相似度发现语义边的阈值与上限（0=仅Spatial,1=仅Semantic,2=Spatial+Semantic）
+  semantic_sim_threshold: 0.7
+  semantic_max_edges: 4096
+  # 修改2：两阶段 Edge Learning（mask 边比例 + 负样本节点对数量）
+  edge_mask_ratio: 0.75
+  num_neg_pairs: 128
+  # 修改3：Graph Context Contrastive Learning
+  contrast_weight: 1.0
+  contrast_temperature: 0.5
+  contrast_proj_dim: 128
+  view_edge_drop: 0.2
+  # DINO 原始结果保存容器（落盘 .pt，含 CLS/patch head 输出、空间聚合特征、坐标等）
+  save_dino_features: false
+  dino_feature_dir: "dino_raw_features"
+  dino_feature_save_every: 1
+  dino_feature_max_files: 0  # 0 = 不限制，>0 时超出则删最早的文件
 optim:
   epochs: 100
   weight_decay: 0.04
