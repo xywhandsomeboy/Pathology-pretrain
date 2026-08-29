@@ -21,10 +21,10 @@ compute_precision:
         param_dtype: fp16
         reduce_dtype: fp32
         buffer_dtype: fp32
-    mlp:
+    node_fusion:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
-        param_dtype: fp16
+        param_dtype: fp32
         reduce_dtype: fp32
         buffer_dtype: fp32
     gcn:
@@ -34,6 +34,18 @@ compute_precision:
         reduce_dtype: fp32
         buffer_dtype: fp32
     spatial_agg:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    mask_token:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    node_decoder:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp32
@@ -52,6 +64,12 @@ compute_precision:
         reduce_dtype: fp32
         buffer_dtype: fp32
     edge_type_head:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    edge_weight_head:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp32
@@ -76,7 +94,8 @@ ibot:
   head_nlayers: 3
   head_hidden_dim: 2048
 train:
-  batch_size_per_gpu: 64
+  # One dataloader sample is one WSI graph; its image patches are GNN nodes.
+  batch_size_per_gpu: 1
   dataset_path: ImageNet:split=TRAIN
   output_dir: .
   saveckp_freq: 20
@@ -104,26 +123,44 @@ student:
   final_momentum: 1
 gcn:
   num_layer: 5
-  emb_dim: 128
+  # The fused node representation remains 1024-D, matching DINOv2 ViT-L.
+  emb_dim: 1024
   JK: "last"
   dropout_ratio: 0
   gnn_type: "gat"
-  # 修改1：子图 patch 特征的空间感知聚合（1x1压缩 + 多尺度DepthwiseConv + 池化）
+  # Raw DINO patch tokens -> 2-D depthwise conv -> global + alpha * spatial.
   spatial_agg_hidden: 256
-  spatial_agg_pool_size: 4
+  spatial_fusion_alpha: 0.1
   # 修改3.2：初始空间图仅根据 WSI 坐标构建（邻接半径）
   spatial_radius: 50.0
   # 修改3出口：context-aware 相似度发现语义边的阈值与上限（0=仅Spatial,1=仅Semantic,2=Spatial+Semantic）
   semantic_sim_threshold: 0.7
   semantic_max_edges: 4096
-  # 修改2：两阶段 Edge Learning（mask 边比例 + 负样本节点对数量）
-  edge_mask_ratio: 0.75
+  # Graph-MAE: random node, contiguous spatial region, and random-walk masks.
+  node_mask_ratio: 0.3
+  node_recon_weight: 1.0
+  node_recon_mse_weight: 1.0
+  node_recon_cos_weight: 1.0
+  # Edge existence -> relation type, with edge attributes as an auxiliary target.
+  edge_mask_ratio: 0.3
   num_neg_pairs: 128
-  # 修改3：Graph Context Contrastive Learning
+  negatives_per_positive: 2
+  edge_existence_weight: 1.0
+  edge_relation_weight: 0.5
+  edge_weight_weight: 0.1
+  # A negative must be far and dissimilar in both visual and contextual spaces.
+  reliable_neg_distance_ratio: 2.0
+  reliable_neg_visual_sim_max: 0.2
+  reliable_neg_context_sim_max: 0.2
+  # Context contrastive views use weak noise and preserve graph topology.
   contrast_weight: 1.0
   contrast_temperature: 0.5
   contrast_proj_dim: 128
-  view_edge_drop: 0.2
+  contrast_alignment_weight: 0.1
+  feature_noise_std: 0.05
+  edge_weight_noise_std: 0.02
+  contrast_feature_mask_ratio: 0.05
+  view_edge_drop: 0.01
   # DINO 原始结果保存容器（落盘 .pt，含 CLS/patch head 输出、空间聚合特征、坐标等）
   save_dino_features: false
   dino_feature_dir: "dino_raw_features"

@@ -123,14 +123,11 @@ class ImageFolder(Dataset):
         graph = torch.load(os.path.join(self.root, slide_name))
         graph = self.get_random_subgraph(graph)
         # print("check -slide",slide_name,graph.x.size(0),graph.edge_index.size(1))
-        # 对graph进行随机遮掩
-        if self.rand_walk:
-            masked_graph = self._random_walk_mask(graph)
-        else:
-            masked_graph = self._mask_graph(graph)
-        
-        slide["graph"] = masked_graph
-        slide["original_graph"] = graph  # 保存原始graph用于损失计算
+        # Mask sampling is now performed inside GCNMetaArch so that random,
+        # spatial-region and random-walk masks share one learnable mask token
+        # and reach exactly the configured ratio.
+        slide["graph"] = graph
+        slide["original_graph"] = graph
         slide["slide_name"] = slide_name
         
         return slide

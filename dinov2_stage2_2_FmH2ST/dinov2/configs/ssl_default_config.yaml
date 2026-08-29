@@ -9,20 +9,39 @@ compute_precision:
         param_dtype: fp32
         reduce_dtype: fp32
         buffer_dtype: fp32
-    pool_gate:
+    mask_token:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp32
         reduce_dtype: fp32
         buffer_dtype: fp32
-    linear_pred_edges:
+    node_decoder:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    projection:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    edge_existence_head:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp32
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    edge_weight_head:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp32
         reduce_dtype: fp32
         buffer_dtype: fp32
 train:
-  batch_size_per_gpu: 2
+  # One sample is one complete WSI graph.
+  batch_size_per_gpu: 1
   dataset_path: ImageNet:split=TRAIN
   output_dir: .
   saveckp_freq: 20
@@ -40,15 +59,36 @@ gcn:
   num_layer: 5
   emb_dim: 1024
   JK: "sum"
-  edge_dim: 1
+  # [spatial_weight, semantic_weight], kept separate for the GNN.
+  edge_dim: 2
   dropout_ratio: 0
   gnn_type: "gat"
   block_chunks: 1
   use_residual: true
   use_layernorm: true
-  mask_strategy: "edge"  # "node" 
-  structure_loss_weight: 0.02
-  graph_consistency_weight: 0.2
+  # Exact-ratio random, spatial-region and random-walk Graph-MAE masks.
+  mask_strategy: "node"
+  node_mask_ratio: 0.3
+  node_recon_weight: 1.0
+  node_recon_mse_weight: 1.0
+  node_recon_cos_weight: 1.0
+  # Edge existence uses masked positives and reliable non-edge negatives.
+  edge_mask_ratio: 0.3
+  negatives_per_positive: 2
+  edge_existence_weight: 1.0
+  edge_weight_weight: 0.1
+  reliable_neg_distance_ratio: 2.0
+  reliable_neg_visual_sim_max: 0.2
+  reliable_neg_context_sim_max: 0.2
+  # Weak noisy views retain almost all graph topology.
+  contrast_weight: 1.0
+  contrast_temperature: 0.5
+  contrast_proj_dim: 128
+  contrast_alignment_weight: 0.1
+  feature_noise_std: 0.05
+  edge_weight_noise_std: 0.02
+  contrast_feature_mask_ratio: 0.05
+  view_edge_drop: 0.01
 optim:
   epochs: 400
   weight_decay: 0.04

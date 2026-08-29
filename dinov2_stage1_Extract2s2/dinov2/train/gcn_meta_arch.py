@@ -3,30 +3,67 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-from functools import partial
 import logging
+import math
 
 import torch
 from torch import nn
 
-from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
 from dinov2.models import build_model_from_cfg
-from dinov2.layers import DINOHead
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
 
 from dinov2.models.vision_transformer import BlockChunk
-from dinov2.models.gcn import GNN, GNN_graphpred
-import torch.nn.functional as F
-from torch_geometric.data import Data
-try:
-    from xformers.ops import fmha
-except ImportError:
-    raise AssertionError("xFormers is required for training")
 
 
 logger = logging.getLogger("dinov2")
+
+
+class SpatialPatchAggregator(nn.Module):
+    """Preserve the 2-D organization of raw DINO patch tokens."""
+
+    def __init__(self, in_dim, hidden_dim=256, out_dim=1024):
+        super().__init__()
+        self.compress = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, 1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+        )
+        self.spatial = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1, groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1, groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GELU(),
+        )
+        self.proj = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, patch_tokens):
+        batch_size, num_tokens, channels = patch_tokens.shape
+        side = math.isqrt(num_tokens)
+        if side * side != num_tokens:
+            raise ValueError(f"DINO token count {num_tokens} is not a square grid")
+        x = patch_tokens.transpose(1, 2).reshape(batch_size, channels, side, side)
+        x = self.spatial(self.compress(x)).mean(dim=(-2, -1))
+        return self.proj(x)
+
+
+class NodeFeatureFusion(nn.Module):
+    def __init__(self, global_dim, out_dim, spatial_scale_init=0.1):
+        super().__init__()
+        self.global_proj = nn.Identity() if global_dim == out_dim else nn.Linear(global_dim, out_dim)
+        self.spatial_scale = nn.Parameter(torch.tensor(float(spatial_scale_init)))
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, global_feature, spatial_feature):
+        return self.norm(self.global_proj(global_feature) + self.spatial_scale * spatial_feature)
 
 
 class GCNMetaArch(nn.Module):
@@ -47,73 +84,18 @@ class GCNMetaArch(nn.Module):
             student_backbone.load_state_dict(chkpt["model"], strict=False)
 
         self.embed_dim = embed_dim
-        self.dino_out_dim = cfg.dino.head_n_prototypes
-
-        self.do_dino = cfg.dino.loss_weight > 0
-        self.do_koleo = cfg.dino.koleo_loss_weight > 0
-        self.do_ibot = cfg.ibot.loss_weight > 0
-        self.ibot_separate_head = cfg.ibot.separate_head
-
-        logger.info("OPTIONS -- DINO")
-        if self.do_dino:
-            logger.info(f"OPTIONS -- DINO -- loss_weight: {cfg.dino.loss_weight}")
-            logger.info(f"OPTIONS -- DINO -- head_n_prototypes: {cfg.dino.head_n_prototypes}")
-            logger.info(f"OPTIONS -- DINO -- head_bottleneck_dim: {cfg.dino.head_bottleneck_dim}")
-            logger.info(f"OPTIONS -- DINO -- head_hidden_dim: {cfg.dino.head_hidden_dim}")
-            self.dino_loss_weight = cfg.dino.loss_weight
-            dino_head = partial(
-                DINOHead,
-                in_dim=embed_dim,
-                out_dim=cfg.dino.head_n_prototypes,
-                hidden_dim=cfg.dino.head_hidden_dim,
-                bottleneck_dim=cfg.dino.head_bottleneck_dim,
-                nlayers=cfg.dino.head_nlayers,
-            )
-            self.dino_loss = DINOLoss(self.dino_out_dim)
-            if self.do_koleo:
-                logger.info("OPTIONS -- DINO -- applying KOLEO regularization")
-                self.koleo_loss = KoLeoLoss()
-
-        else:
-            logger.info("OPTIONS -- DINO -- not using DINO")
-
-        if self.do_dino or self.do_ibot:
-            student_model_dict["dino_head"] = dino_head()
-
-        logger.info("OPTIONS -- IBOT")
-        logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}")
-        if self.do_ibot:
-            self.ibot_loss_weight = cfg.ibot.loss_weight
-            assert max(cfg.ibot.mask_ratio_min_max) > 0, "please provide a positive mask ratio tuple for ibot"
-            assert cfg.ibot.mask_sample_probability > 0, "please provide a positive mask probability for ibot"
-            self.ibot_out_dim = cfg.ibot.head_n_prototypes if self.ibot_separate_head else cfg.dino.head_n_prototypes
-            self.ibot_patch_loss = iBOTPatchLoss(self.ibot_out_dim)
-            if self.ibot_separate_head:
-                logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
-                logger.info(f"OPTIONS -- IBOT -- head_n_prototypes: {cfg.ibot.head_n_prototypes}")
-                logger.info(f"OPTIONS -- IBOT -- head_bottleneck_dim: {cfg.ibot.head_bottleneck_dim}")
-                logger.info(f"OPTIONS -- IBOT -- head_hidden_dim: {cfg.ibot.head_hidden_dim}")
-                ibot_head = partial(
-                    DINOHead,
-                    in_dim=embed_dim,
-                    out_dim=cfg.ibot.head_n_prototypes,
-                    hidden_dim=cfg.ibot.head_hidden_dim,
-                    bottleneck_dim=cfg.ibot.head_bottleneck_dim,
-                    nlayers=cfg.ibot.head_nlayers,
-                )
-                student_model_dict["ibot_head"] = ibot_head()
-            else:
-                logger.info("OPTIONS -- IBOT -- head shared with DINO")
-
         self.need_to_synchronize_fsdp_streams = True
+
+        student_model_dict["spatial_agg"] = SpatialPatchAggregator(
+            embed_dim, cfg.feature.spatial_agg_hidden, cfg.feature.out_dim
+        )
+        student_model_dict["node_fusion"] = NodeFeatureFusion(
+            embed_dim, cfg.feature.out_dim, cfg.feature.spatial_fusion_alpha
+        )
 
         self.student = nn.ModuleDict(student_model_dict)
 
-        student_dtype = next(self.student.backbone.parameters()).dtype
-        
-        logger.info(f"Student and GCN are built: they are both {cfg.student.arch} network.")
+        logger.info("DINO extractor built with spatially fused %d-D output", cfg.feature.out_dim)
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -126,70 +108,15 @@ class GCNMetaArch(nn.Module):
     
     def dino_encoder(self, images):
         n_global_crops = 2
-        assert n_global_crops == 2
-        batch_size = int(images["collated_global_crops"].shape[0]/n_global_crops)
-        n_local_crops = self.cfg.crops.local_crops_number
-        
+        batch_size = images["collated_global_crops"].shape[0] // n_global_crops
         global_crops = images["collated_global_crops"].cuda(non_blocking=True)
-        local_crops = images["collated_local_crops"].cuda(non_blocking=True)
-
-        student_global_backbone_output_dict, student_local_backbone_output_dict = self.student.backbone(
-            [global_crops, local_crops], masks=[None, None], is_training=True
-        )
-
-        inputs_for_student_head_list = []
-
-        # 1a: local crops cls tokens
-        student_local_cls_tokens = student_local_backbone_output_dict["x_norm_clstoken"]
-        
-        inputs_for_student_head_list.append(student_local_cls_tokens.unsqueeze(0))
-
-        # 1b: global crops cls tokens
-        student_global_cls_tokens = student_global_backbone_output_dict["x_norm_clstoken"]
-        
-        inputs_for_student_head_list.append(student_global_cls_tokens.unsqueeze(0))
-
-        # 1c: global crops patch tokens
-        if self.do_ibot:
-            _dim = student_global_backbone_output_dict["x_norm_clstoken"].shape[-1]
-            B = student_global_backbone_output_dict["x_norm_patchtokens"].shape[0]
-            num_tokens = student_global_backbone_output_dict["x_norm_patchtokens"].shape[1]
-            ibot_student_patch_tokens = student_global_backbone_output_dict["x_norm_patchtokens"].flatten(0, 1)
-
-            if not self.ibot_separate_head:
-                
-                inputs_for_student_head_list.append(ibot_student_patch_tokens.unsqueeze(0))
-            else:
-                student_global_masked_patch_tokens_after_head = self.student.ibot_head(ibot_student_patch_tokens)
-
-        # 2: run
-        _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_for_student_head_list)
-        outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
-
-        # 3a: local crops cls tokens
-        student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
-
-        # 3b: global crops cls tokens
-        student_global_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
-
-        # 3c: global crops patch tokens
-        if self.do_ibot and not self.ibot_separate_head:
-            student_global_masked_patch_tokens_after_head = outputs_list.pop(0).squeeze(0)
-
-        student_global_cls_tokens_after_head = student_global_cls_tokens_after_head.view(n_global_crops,batch_size,-1)
-        student_local_cls_tokens_after_head = student_local_cls_tokens_after_head.view(n_local_crops,batch_size,-1)
-        student_global_masked_patch_tokens_after_head = student_global_masked_patch_tokens_after_head.view((n_global_crops,batch_size,num_tokens,-1))
-        
-        student_global_mean_feat = student_global_cls_tokens_after_head.mean(dim=0)
-        student_local_mean_feat = student_local_cls_tokens_after_head.mean(dim=0)
-        student_global_patch_mean_feat = student_global_masked_patch_tokens_after_head.mean(dim=(0, 2))
-        
-        print("check global:",student_global_mean_feat.shape)
-        print("check2 local:",student_local_mean_feat.shape)
-        print("check3 global patch:",student_global_patch_mean_feat.shape)
-        cat_feat = (student_global_mean_feat+student_global_patch_mean_feat+student_local_mean_feat)/3
-
-        return cat_feat
+        output = self.student.backbone(global_crops, masks=None, is_training=True)
+        global_feature = output["x_norm_clstoken"].view(n_global_crops, batch_size, -1).mean(0)
+        patch_tokens = output["x_norm_patchtokens"]
+        spatial_feature = self.student.spatial_agg(patch_tokens.float()).view(
+            n_global_crops, batch_size, -1
+        ).mean(0).to(global_feature.dtype)
+        return self.student.node_fusion(global_feature, spatial_feature)
         
 
     def forward_backward(self, images):
@@ -208,7 +135,8 @@ class GCNMetaArch(nn.Module):
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
-            self.student.dino_head._streams = self.student.backbone._streams
+            self.student.spatial_agg._streams = self.student.backbone._streams
+            self.student.node_fusion._streams = self.student.backbone._streams
             self.need_to_synchronize_fsdp_streams = False
 
     def train(self, mode: bool = True): 
@@ -242,4 +170,3 @@ class GCNMetaArch(nn.Module):
             print(k)
             student_model_cfg = self.cfg.compute_precision.student[k]
             self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
-

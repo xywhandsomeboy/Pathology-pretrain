@@ -291,9 +291,28 @@ def main(args):
     cfg = setup(args)
     
     model = GCNMetaArch(cfg).to(torch.device("cuda"))
-    checkpoint = torch.load(cfg.MODEL.WEIGHTS)['teacher']
+    checkpoint = torch.load(cfg.MODEL.WEIGHTS, map_location="cpu")
+    checkpoint = checkpoint.get(
+        "student", checkpoint.get("teacher", checkpoint.get("model", checkpoint))
+    )
+    if checkpoint and all(key.startswith("student.") for key in checkpoint):
+        checkpoint = {key.removeprefix("student."): value for key, value in checkpoint.items()}
     # print(checkpoint.keys())
-    model.student.load_state_dict(checkpoint)
+    incompatible = model.student.load_state_dict(checkpoint, strict=False)
+    spatial_missing = [
+        key for key in incompatible.missing_keys
+        if key.startswith("spatial_agg.") or key.startswith("node_fusion.")
+    ]
+    if spatial_missing:
+        message = (
+            f"Checkpoint has no trained spatial feature branch "
+            f"({len(spatial_missing)} missing tensors). Train it in "
+            "dinov2_finetune or load a compatible checkpoint before producing "
+            "final Stage-1 features."
+        )
+        if cfg.feature.require_trained_spatial:
+            raise RuntimeError(message)
+        logger.warning("%s Continuing only because feature.require_trained_spatial=false.", message)
 
     # model.prepare_for_distributed_training()
     

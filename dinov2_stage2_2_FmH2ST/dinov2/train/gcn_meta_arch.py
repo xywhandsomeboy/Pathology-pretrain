@@ -1,219 +1,223 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the Apache License, Version 2.0
-# found in the LICENSE file in the root directory of this source tree.
-
-from functools import partial
 import logging
-
 import torch
 from torch import nn
+import torch.nn.functional as F
+
 from dinov2.models import build_model_from_cfg
+from dinov2.models.gcn import GNNChunk
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
-from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
-
-from dinov2.models.gcn import GNNChunk
-from dinov2.models.gcn import GNN, GNN_graphpred
-import torch.nn.functional as F
-from torch_geometric.data import Data
-from torch_geometric.nn import global_add_pool
-from torch_geometric.utils import softmax as pyg_softmax
-try:
-    from xformers.ops import fmha
-except ImportError:
-    raise AssertionError("xFormers is required for training")
-
+from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler
 
 logger = logging.getLogger("gnn")
 
 
+class LearnableMaskToken(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.token = nn.Parameter(torch.empty(1, dim))
+        nn.init.normal_(self.token, std=0.02)
+
+    def forward(self, x, mask):
+        return torch.where(mask.unsqueeze(-1), self.token.to(x.dtype), x)
+
+
 class GCNMetaArch(nn.Module):
+    """Offline graph pretraining aligned with the finetune graph objectives."""
+
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
-
-        student_model_dict = dict()
-
-        logger.info("OPTIONS -- GNN")
+        gcn, dim = build_model_from_cfg(cfg)
+        pair_dim = dim * 3
+        self.student = nn.ModuleDict({
+            "gcn": gcn,
+            "mask_token": LearnableMaskToken(dim),
+            "node_decoder": nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim)),
+            "projection": nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, cfg.gcn.contrast_proj_dim)),
+            "edge_existence_head": nn.Sequential(nn.Linear(pair_dim, dim), nn.GELU(), nn.Linear(dim, 1)),
+            "edge_weight_head": nn.Sequential(nn.Linear(pair_dim, dim), nn.GELU(), nn.Linear(dim, cfg.gcn.edge_dim)),
+        })
         self.need_to_synchronize_fsdp_streams = True
-        GNN_backbone, embed_dim = build_model_from_cfg(cfg)
-        
-        student_model_dict["gcn"] = GNN_backbone
-        pool_hidden_dim = max(embed_dim // 4, 64)
-        student_model_dict["pool_gate"] = torch.nn.Sequential(
-            torch.nn.LayerNorm(embed_dim),
-            torch.nn.Linear(embed_dim, pool_hidden_dim),
-            torch.nn.GELU(),
-            torch.nn.Linear(pool_hidden_dim, 1),
-        )
-
-        if cfg.gcn.mask_strategy == "edge":
-            student_model_dict["linear_pred_edges"] = torch.nn.Linear(embed_dim, 1)
-        elif cfg.gcn.mask_strategy == "node":
-            student_model_dict["linear_pred_nodes"] = torch.nn.Linear(embed_dim, embed_dim)
-
-        self.student = nn.ModuleDict(student_model_dict)
-        
-        logger.info(f"Student and GCN are built: they are both {cfg.gcn.arch} network.")
+        logger.info("Offline graph pretraining model built with %d-D nodes", dim)
 
     def forward(self, inputs):
         raise NotImplementedError
 
     def backprop_loss(self, loss):
-        if self.fp16_scaler is not None:
-            self.fp16_scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        (self.fp16_scaler.scale(loss) if self.fp16_scaler is not None else loss).backward()
 
-    def global_pooling(self, node_rep, batch):
-        gate_logits = self.student.pool_gate(node_rep).squeeze(-1)
-        gate_weights = pyg_softmax(gate_logits, batch)
-        weighted_rep = node_rep * gate_weights.unsqueeze(-1)
-        return global_add_pool(weighted_rep, batch)
+    @staticmethod
+    def _unique_pairs(edge_index):
+        if edge_index.numel() == 0:
+            return edge_index.new_empty((0, 2))
+        pairs = torch.sort(edge_index.t(), dim=1).values
+        return torch.unique(pairs[pairs[:, 0] != pairs[:, 1]], dim=0)
+
+    def _node_masks(self, graph, pairs):
+        n, device = graph.x.size(0), graph.x.device
+        target = 0 if n < 2 else min(n - 1, max(1, round(n * self.cfg.gcn.node_mask_ratio)))
+        empty = torch.zeros(n, dtype=torch.bool, device=device)
+        if target == 0:
+            return {name: empty.clone() for name in ("random", "region", "random_walk")}
+        random_mask = empty.clone()
+        random_mask[torch.randperm(n, device=device)[:target]] = True
+        region_mask = empty.clone()
+        if getattr(graph, "pos", None) is not None:
+            seed = torch.randint(n, (1,), device=device)
+            distance = torch.cdist(graph.pos[seed].float(), graph.pos.float()).squeeze(0)
+            region_mask[distance.argsort()[:target]] = True
+        else:
+            region_mask[torch.randperm(n, device=device)[:target]] = True
+        adjacency = [[] for _ in range(n)]
+        for left, right in pairs.detach().cpu().tolist():
+            adjacency[left].append(right)
+            adjacency[right].append(left)
+        selected, current = set(), int(torch.randint(n, (1,)).item())
+        while len(selected) < target:
+            selected.add(current)
+            candidates = [v for v in adjacency[current] if v not in selected]
+            if candidates:
+                current = candidates[int(torch.randint(len(candidates), (1,)).item())]
+            else:
+                remaining = list(set(range(n)) - selected)
+                if not remaining:
+                    break
+                current = remaining[int(torch.randint(len(remaining), (1,)).item())]
+        walk_mask = empty.clone()
+        walk_mask[torch.tensor(list(selected), device=device)] = True
+        return {"random": random_mask, "region": region_mask, "random_walk": walk_mask}
+
+    def _node_reconstruction(self, graph, pairs):
+        losses, details = [], {}
+        for name, mask in self._node_masks(graph, pairs).items():
+            if mask.any():
+                h = self.student.gcn(self.student.mask_token(graph.x, mask), graph.edge_index, graph.edge_attr)
+                pred, target = self.student.node_decoder(h[mask]), graph.x.detach()[mask]
+                mse = F.mse_loss(pred.float(), target.float())
+                cosine = (1 - F.cosine_similarity(pred.float(), target.float(), dim=-1)).mean()
+                loss = self.cfg.gcn.node_recon_mse_weight * mse + self.cfg.gcn.node_recon_cos_weight * cosine
+            else:
+                loss = graph.x.sum() * 0.0
+            losses.append(loss)
+            details[f"node_reconstruction_{name}"] = loss
+        return torch.stack(losses).mean(), details
+
+    def _noisy_view(self, graph):
+        x = graph.x + torch.randn_like(graph.x) * self.cfg.gcn.feature_noise_std
+        if self.cfg.gcn.contrast_feature_mask_ratio > 0:
+            x *= (torch.rand_like(x) >= self.cfg.gcn.contrast_feature_mask_ratio).to(x.dtype)
+        edge_attr = graph.edge_attr.clone()
+        if edge_attr.numel() and self.cfg.gcn.edge_weight_noise_std > 0:
+            edge_attr *= 1 + torch.randn_like(edge_attr) * self.cfg.gcn.edge_weight_noise_std
+        keep = torch.rand(graph.edge_index.size(1), device=x.device) >= self.cfg.gcn.view_edge_drop
+        if keep.numel() and not keep.any():
+            keep[torch.randint(keep.numel(), (1,), device=x.device)] = True
+        return self.student.gcn(x, graph.edge_index[:, keep], edge_attr[keep])
+
+    def _reliable_negatives(self, graph, visual_h, context_h, pairs):
+        visual = F.normalize(visual_h.float(), dim=-1)
+        context = F.normalize(context_h.float(), dim=-1)
+        mask = ((visual @ visual.t()) <= self.cfg.gcn.reliable_neg_visual_sim_max) & ((context @ context.t()) <= self.cfg.gcn.reliable_neg_context_sim_max)
+        if getattr(graph, "pos", None) is not None and pairs.numel():
+            edge_distance = (graph.pos[pairs[:, 0]].float() - graph.pos[pairs[:, 1]].float()).norm(dim=-1)
+            reference = edge_distance.median().clamp_min(1e-6)
+            mask &= torch.cdist(graph.pos.float(), graph.pos.float()) >= reference * self.cfg.gcn.reliable_neg_distance_ratio
+        mask.fill_diagonal_(False)
+        if pairs.numel():
+            mask[pairs[:, 0], pairs[:, 1]] = False
+            mask[pairs[:, 1], pairs[:, 0]] = False
+        return mask
+
+    def _contrastive_loss(self, h1, h2, negatives):
+        z1 = F.normalize(self.student.projection(h1).float(), dim=-1)
+        z2 = F.normalize(self.student.projection(h2).float(), dim=-1)
+        logits = z1 @ z2.t() / self.cfg.gcn.contrast_temperature
+        allowed = negatives | torch.eye(z1.size(0), dtype=torch.bool, device=z1.device)
+        labels = torch.arange(z1.size(0), device=z1.device)
+        nce = (F.cross_entropy(logits.masked_fill(~allowed, -torch.inf), labels) + F.cross_entropy(logits.t().masked_fill(~allowed.t(), -torch.inf), labels)) / 2
+        return nce + self.cfg.gcn.contrast_alignment_weight * (1 - (z1 * z2).sum(-1)).mean()
+
+    @staticmethod
+    def _pair_features(h, pairs):
+        left, right = h[pairs[:, 0]], h[pairs[:, 1]]
+        return torch.cat((left + right, (left - right).abs(), left * right), dim=-1)
+
+    def _edge_losses(self, graph, pairs, negatives):
+        zero = graph.x.sum() * 0.0
+        if not pairs.numel():
+            return zero, zero
+        count = min(pairs.size(0), max(1, round(pairs.size(0) * self.cfg.gcn.edge_mask_ratio)))
+        positive = pairs[torch.randperm(pairs.size(0), device=graph.x.device)[:count]]
+        selected_key = positive[:, 0] * graph.x.size(0) + positive[:, 1]
+        directed = torch.sort(graph.edge_index.t(), dim=1).values
+        directed_key = directed[:, 0] * graph.x.size(0) + directed[:, 1]
+        keep = ~torch.isin(directed_key, selected_key)
+        h = self.student.gcn(graph.x, graph.edge_index[:, keep], graph.edge_attr[keep])
+        candidates = torch.triu(negatives, diagonal=1).nonzero()
+        if candidates.numel():
+            candidates = candidates[torch.randperm(candidates.size(0), device=graph.x.device)]
+        negative = candidates[:min(candidates.size(0), count * self.cfg.gcn.negatives_per_positive)]
+        if negative.numel():
+            all_pairs = torch.cat((positive, negative))
+            labels = torch.cat((torch.ones(count, device=h.device), torch.zeros(negative.size(0), device=h.device)))
+            logits = self.student.edge_existence_head(self._pair_features(h, all_pairs)).squeeze(-1)
+            existence = F.binary_cross_entropy_with_logits(logits, labels)
+        else:
+            existence = zero
+        targets = []
+        for pair in positive:
+            match = (directed == pair).all(dim=1).nonzero(as_tuple=False)[0, 0]
+            targets.append(graph.edge_attr[match])
+        predicted = self.student.edge_weight_head(self._pair_features(h, positive))
+        return existence, F.mse_loss(predicted.float(), torch.stack(targets).float())
 
     def forward_backward(self, images):
-        mse_criterion = nn.MSELoss()
-        loss_dict = {}
-        loss_accumulator = 0
-
-        # 获取遮掩图和原始图
-        masked_graph = images["graph"]  # 遮掩后的图（模型输入）
-        original_graph = images["original_graph"]  # 原始图（监督信号）
-
-        device = next(self.student.parameters()).device
-        original_graph = original_graph.to(device)
-        masked_graph = masked_graph.to(device)
-
-        ### GCN encoder - 使用遮掩图作为输入
-        x = masked_graph.x.to(device)
-        edge_index = masked_graph.edge_index.to(device)
-        edge_attr = masked_graph.edge_attr.to(device) if hasattr(masked_graph, 'edge_attr') else None
-
-        node_rep = self.student.gcn(x, edge_index, edge_attr)
-        batch = masked_graph.batch if hasattr(masked_graph, "batch") else torch.zeros(
-            node_rep.size(0), dtype=torch.long, device=device
-        )
-
-        ### 任务1: 边重建 - 与原始图的边比较
-        if hasattr(masked_graph, 'masked_edge_indices') and masked_graph.masked_edge_indices is not None:
-            mask_indices = masked_graph.masked_edge_indices.to(device)
-            original_edge_index = original_graph.edge_index.to(device)
-        
-            # 被遮掩的边在原始图中的真实连接
-            true_masked_edges = original_edge_index[:, mask_indices].t()
-        
-            # 生成这些边的预测表示
-            edge_rep = node_rep[true_masked_edges[:, 0]] + node_rep[true_masked_edges[:, 1]]
-            pred_edge_weights = self.student.linear_pred_edges(edge_rep)
-        
-            # 取出原始图的真实边权重
-            if hasattr(original_graph, 'edge_attr') and original_graph.edge_attr is not None:
-                true_edge_weights = original_graph.edge_attr[mask_indices].to(device)
-            else:
-                # 如果没有edge_attr，就默认全1（表示存在）
-                true_edge_weights = torch.ones(len(mask_indices), 1, dtype=torch.float32).to(device)
-        
-            # 边权重重建损失（MSE）
-            edge_loss = F.mse_loss(pred_edge_weights, true_edge_weights)
-            loss_accumulator += edge_loss
-            loss_dict["edge_reconstruction"] = edge_loss
-
-        ### 任务2: 节点特征重建 - 与原始节点特征比较
-        if hasattr(masked_graph, 'mask_indices') and masked_graph.mask_indices is not None:
-            mask_indices = masked_graph.mask_indices.to(device)
-            if len(mask_indices) > 0:
-                # 预测被遮掩节点的特征
-                pred_features = self.student.linear_pred_nodes(node_rep[mask_indices])
-
-                # 获取原始图中这些节点的真实特征
-                true_features = original_graph.x[mask_indices].to(device)
-
-                feature_loss = mse_criterion(pred_features, true_features)
-                loss_accumulator += feature_loss
-                loss_dict["node_reconstruction"] = feature_loss
-
-        ### 任务3: 图级表示学习 - 与原始图结构一致性
-        # 使用原始图的邻接矩阵作为监督信号
-        original_adj = self._build_adjacency_matrix(original_graph).to(device)
-        current_adj = self._build_adjacency_matrix_from_rep(node_rep, original_graph.edge_index.to(device))
-
-        structure_loss = mse_criterion(current_adj, original_adj)
-        structure_loss_weight = float(getattr(self.cfg.gcn, "structure_loss_weight", 0.02))
-        loss_accumulator += structure_loss * structure_loss_weight
-        loss_dict["structure_consistency"] = structure_loss
-
-        ### 任务4: masked/original 图级表示一致性
-        original_x = original_graph.x.to(device)
-        original_edge_index = original_graph.edge_index.to(device)
-        original_edge_attr = original_graph.edge_attr.to(device) if hasattr(original_graph, "edge_attr") else None
-        original_node_rep = self.student.gcn(original_x, original_edge_index, original_edge_attr)
-        original_batch = original_graph.batch if hasattr(original_graph, "batch") else torch.zeros(
-            original_node_rep.size(0), dtype=torch.long, device=device
-        )
-
-        masked_graph_rep = self.global_pooling(node_rep, batch)
-        original_graph_rep = self.global_pooling(original_node_rep, original_batch)
-        graph_consistency_loss = 1 - F.cosine_similarity(masked_graph_rep, original_graph_rep, dim=-1).mean()
-        graph_consistency_weight = float(getattr(self.cfg.gcn, "graph_consistency_weight", 0.2))
-        loss_accumulator += graph_consistency_weight * graph_consistency_loss
-        loss_dict["graph_consistency"] = graph_consistency_loss
-
-        loss_dict["total_loss"] = loss_accumulator
-
-        self.backprop_loss(loss_accumulator)
+        graph = images["original_graph"].to(next(self.student.parameters()).device)
+        if graph.edge_attr is None:
+            graph.edge_attr = torch.ones((graph.edge_index.size(1), self.cfg.gcn.edge_dim), device=graph.x.device)
+        if graph.edge_attr.ndim == 1:
+            graph.edge_attr = graph.edge_attr.unsqueeze(-1)
+        if graph.edge_attr.size(-1) != self.cfg.gcn.edge_dim:
+            raise ValueError(
+                f"Expected {self.cfg.gcn.edge_dim}-D edge_attr, got "
+                f"{graph.edge_attr.size(-1)}. Rebuild old .pt graphs with "
+                "dinov2.data.datasets.graph_builder so spatial and semantic "
+                "weights are stored separately."
+            )
+        pairs = self._unique_pairs(graph.edge_index)
+        node_loss, details = self._node_reconstruction(graph, pairs)
+        h1, h2 = self._noisy_view(graph), self._noisy_view(graph)
+        context = (h1 + h2) / 2
+        negatives = self._reliable_negatives(graph, graph.x.detach(), context.detach(), pairs)
+        contrast_loss = self._contrastive_loss(h1, h2, negatives)
+        existence_loss, weight_loss = self._edge_losses(graph, pairs, negatives)
+        total = self.cfg.gcn.node_recon_weight * node_loss + self.cfg.gcn.contrast_weight * contrast_loss + self.cfg.gcn.edge_existence_weight * existence_loss + self.cfg.gcn.edge_weight_weight * weight_loss
+        losses = {**details, "node_reconstruction": node_loss, "graph_contrastive": contrast_loss, "edge_existence": existence_loss, "edge_weight": weight_loss, "total_loss": total}
+        self.backprop_loss(total)
         self.fsdp_synchronize_streams()
-
-        return loss_dict
-
-    def _build_adjacency_matrix(self, graph):
-        """从图构建邻接矩阵"""
-        num_nodes = graph.x.size(0)
-        adj = torch.zeros((num_nodes, num_nodes))
-        adj[graph.edge_index[0], graph.edge_index[1]] = 1
-        return adj
-
-    def _build_adjacency_matrix_from_rep(self, node_rep, edge_index):
-        """从节点表示重建邻接矩阵"""
-        # 使用节点表示计算相似度作为邻接概率
-        similarity = torch.mm(node_rep, node_rep.t())
-        return similarity
+        return losses
 
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
-#             self.student.dino_head._streams = self.student.backbone._streams
             self.need_to_synchronize_fsdp_streams = False
 
-    def train(self):
-        super().train()
+    def train(self, mode=True):
+        return super().train(mode)
 
-    def get_maybe_fused_params_for_submodel(self, m):
-        params_groups = get_params_groups_with_decay(
-            model=m,
-            lr_decay_rate=self.cfg.optim.layerwise_decay,
-            patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult,
-        )
-        fused_params_groups = fuse_params_groups(params_groups)
-        logger.info("fusing param groups")
-
-        for g in fused_params_groups:
-            g["foreach"] = True
-        return fused_params_groups
+    def get_maybe_fused_params_for_submodel(self, model):
+        groups = fuse_params_groups(get_params_groups_with_decay(model=model, lr_decay_rate=self.cfg.optim.layerwise_decay, patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult))
+        for group in groups:
+            group["foreach"] = True
+        return groups
 
     def get_params_groups(self):
-        all_params_groups = []
-        for m in self.student.values():
-            all_params_groups += self.get_maybe_fused_params_for_submodel(m)
-        return all_params_groups
+        return sum((self.get_maybe_fused_params_for_submodel(model) for model in self.student.values()), [])
 
     def prepare_for_distributed_training(self):
-        logger.info("DISTRIBUTED FSDP -- preparing model for distributed training")
         if has_batchnorms(self.student):
             raise NotImplementedError
-        # below will synchronize all student subnetworks across gpus:
-        for k, v in self.student.items():
-            print(k)
-            student_model_cfg = self.cfg.compute_precision.student[k]
-            self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={GNNChunk})(self.student[k])
+        for name, model in self.student.items():
+            self.student[name] = get_fsdp_wrapper(self.cfg.compute_precision.student[name], modules_to_wrap={GNNChunk})(model)

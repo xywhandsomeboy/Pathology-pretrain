@@ -45,10 +45,11 @@ class ImageFolder(Dataset):
 
         
     def __len__(self):
-        return len(self.file_info)
+        # One dataset item is one WSI graph, not one row/image patch.
+        return len(self.slide_names)
     
     def __getitem__(self, idx):
-        slide_name = self.file_info.iloc[idx]['slide_name_split']
+        slide_name = self.slide_names[idx]
         patch_paths = self.slide_patch_map[slide_name]
         
 

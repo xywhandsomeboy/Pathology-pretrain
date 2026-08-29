@@ -3,7 +3,6 @@
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
-from functools import partial
 import logging
 import math
 import os
@@ -11,64 +10,88 @@ import os
 import torch
 from torch import nn
 
-from dinov2.loss import DINOLoss, iBOTPatchLoss, KoLeoLoss
 from dinov2.models import build_model_from_cfg
-from dinov2.layers import DINOHead
 from dinov2.utils.utils import has_batchnorms
 from dinov2.utils.param_groups import get_params_groups_with_decay, fuse_params_groups
 from dinov2.fsdp import get_fsdp_wrapper, ShardedGradScaler, get_fsdp_modules, reshard_fsdp_model
 
 from dinov2.models.vision_transformer import BlockChunk
-from dinov2.models.gcn import GNN, GNN_graphpred
+from dinov2.models.gcn import GNN
 import torch.nn.functional as F
-try:
-    from xformers.ops import fmha
-except ImportError:
-    raise AssertionError("xFormers is required for training")
 
 
 logger = logging.getLogger("dinov2")
 
 
 class SpatialPatchAggregator(nn.Module):
-    """修改 1：子图内部 patch 特征的空间感知聚合。
+    """Aggregate raw DINO patch tokens without destroying their 2-D layout."""
 
-    原实现直接对子图内所有 DINO patch feature 做 mean，丢掉了
-    "patch 在子图中的空间位置" 信息。这里改为：
-
-        DINO patch tokens -> 重排成 2D 网格 -> 1x1 通道压缩 ->
-        多尺度 Depthwise Conv (3x3 / 5x5) -> 自适应池化(下采样) -> 固定尺寸向量
-
-    即保留局部空间结构与多尺度语义后，再压缩成一张子图的节点特征，
-    仍然保持：1 张病理子图 = 1 个 GNN 节点。
-    """
-
-    def __init__(self, in_dim, hidden_dim=256, pool_size=4):
+    def __init__(self, in_dim, hidden_dim=256, out_dim=1024):
         super().__init__()
-        self.pool_size = pool_size
-        # 通道压缩：head_n_prototypes 维度太大，先用 1x1 conv 压缩再做空间卷积
-        self.compress = nn.Conv2d(in_dim, hidden_dim, kernel_size=1)
-        # 多尺度 Depthwise Conv：3x3 捕捉局部结构，5x5 提供更大感受野
-        self.dw_conv3 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, groups=hidden_dim)
-        self.dw_conv5 = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=5, padding=2, groups=hidden_dim)
-        self.fuse = nn.Sequential(
-            nn.Conv2d(hidden_dim * 2, hidden_dim, kernel_size=1),
-            nn.ReLU(inplace=True),
+        self.compress = nn.Sequential(
+            nn.Conv2d(in_dim, hidden_dim, kernel_size=1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
         )
-        # 下采样到固定尺寸，保证输出与 patch 网格大小无关
-        self.pool = nn.AdaptiveAvgPool2d(pool_size)
+        self.spatial = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, 3, padding=1, groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1, groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GroupNorm(1, hidden_dim),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=2, padding=1, groups=hidden_dim, bias=False),
+            nn.Conv2d(hidden_dim, hidden_dim, 1, bias=False),
+            nn.GELU(),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Linear(hidden_dim, out_dim)
 
     def forward(self, patch_tokens):
-        # patch_tokens: [B, T, C]，T = H * W（如 224/16 -> 14x14=196）
-        B, T, C = patch_tokens.shape
-        H = W = int(math.sqrt(T))
-        assert H * W == T, f"patch token 数量 {T} 不是完全平方数，无法重排成空间网格"
-        x = patch_tokens.transpose(1, 2).reshape(B, C, H, W)
-        x = self.compress(x)
-        x = torch.cat([self.dw_conv3(x), self.dw_conv5(x)], dim=1)
-        x = self.fuse(x)
-        x = self.pool(x)  # [B, hidden, P, P]
-        return x.flatten(1)  # [B, hidden * P * P]，固定尺寸
+        # patch_tokens: [B, T, C], where T is the ViT token grid area.
+        batch_size, num_tokens, channels = patch_tokens.shape
+        grid_size = math.isqrt(num_tokens)
+        if grid_size * grid_size != num_tokens:
+            raise ValueError(
+                f"patch token count {num_tokens} is not a square grid; "
+                "spatial aggregation requires H * W tokens"
+            )
+        x = patch_tokens.transpose(1, 2).reshape(
+            batch_size, channels, grid_size, grid_size
+        )
+        x = self.pool(self.spatial(self.compress(x))).flatten(1)
+        return self.proj(x)
+
+
+class NodeFeatureFusion(nn.Module):
+    """Fuse the global DINO feature with a learnable spatial residual."""
+
+    def __init__(self, global_dim, out_dim, spatial_scale_init=0.1):
+        super().__init__()
+        self.global_proj = (
+            nn.Identity() if global_dim == out_dim else nn.Linear(global_dim, out_dim)
+        )
+        self.spatial_scale = nn.Parameter(torch.tensor(float(spatial_scale_init)))
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, global_feature, spatial_feature):
+        return self.norm(
+            self.global_proj(global_feature) + self.spatial_scale * spatial_feature
+        )
+
+
+class LearnableMaskToken(nn.Module):
+    """Replace selected nodes with a learned token instead of graph-wide mean."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.token = nn.Parameter(torch.zeros(1, dim))
+        nn.init.normal_(self.token, std=0.02)
+
+    def forward(self, node_features, mask):
+        return torch.where(mask.unsqueeze(-1), self.token.to(node_features.dtype), node_features)
 
 
 class DINOFeatureContainer:
@@ -147,82 +170,19 @@ class GCNMetaArch(nn.Module):
             student_backbone.load_state_dict(chkpt["model"], strict=False)
 
         self.embed_dim = embed_dim
-        self.dino_out_dim = cfg.dino.head_n_prototypes
-
-        self.do_dino = cfg.dino.loss_weight > 0
-        self.do_koleo = cfg.dino.koleo_loss_weight > 0
-        self.do_ibot = cfg.ibot.loss_weight > 0
-        self.ibot_separate_head = cfg.ibot.separate_head
-
-        logger.info("OPTIONS -- DINO")
-        if self.do_dino:
-            logger.info(f"OPTIONS -- DINO -- loss_weight: {cfg.dino.loss_weight}")
-            logger.info(f"OPTIONS -- DINO -- head_n_prototypes: {cfg.dino.head_n_prototypes}")
-            logger.info(f"OPTIONS -- DINO -- head_bottleneck_dim: {cfg.dino.head_bottleneck_dim}")
-            logger.info(f"OPTIONS -- DINO -- head_hidden_dim: {cfg.dino.head_hidden_dim}")
-            self.dino_loss_weight = cfg.dino.loss_weight
-            dino_head = partial(
-                DINOHead,
-                in_dim=embed_dim,
-                out_dim=cfg.dino.head_n_prototypes,
-                hidden_dim=cfg.dino.head_hidden_dim,
-                bottleneck_dim=cfg.dino.head_bottleneck_dim,
-                nlayers=cfg.dino.head_nlayers,
-            )
-            self.dino_loss = DINOLoss(self.dino_out_dim)
-            if self.do_koleo:
-                logger.info("OPTIONS -- DINO -- applying KOLEO regularization")
-                self.koleo_loss = KoLeoLoss()
-
-        else:
-            logger.info("OPTIONS -- DINO -- not using DINO")
-
-        if self.do_dino or self.do_ibot:
-            student_model_dict["dino_head"] = dino_head()
-
-        logger.info("OPTIONS -- IBOT")
-        logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_ratio_tuple: {cfg.ibot.mask_ratio_min_max}")
-        logger.info(f"OPTIONS -- IBOT masking -- ibot_mask_sample_probability: {cfg.ibot.mask_sample_probability}")
-        if self.do_ibot:
-            self.ibot_loss_weight = cfg.ibot.loss_weight
-            assert max(cfg.ibot.mask_ratio_min_max) > 0, "please provide a positive mask ratio tuple for ibot"
-            assert cfg.ibot.mask_sample_probability > 0, "please provide a positive mask probability for ibot"
-            self.ibot_out_dim = cfg.ibot.head_n_prototypes if self.ibot_separate_head else cfg.dino.head_n_prototypes
-            self.ibot_patch_loss = iBOTPatchLoss(self.ibot_out_dim)
-            if self.ibot_separate_head:
-                logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
-                logger.info(f"OPTIONS -- IBOT -- head_n_prototypes: {cfg.ibot.head_n_prototypes}")
-                logger.info(f"OPTIONS -- IBOT -- head_bottleneck_dim: {cfg.ibot.head_bottleneck_dim}")
-                logger.info(f"OPTIONS -- IBOT -- head_hidden_dim: {cfg.ibot.head_hidden_dim}")
-                ibot_head = partial(
-                    DINOHead,
-                    in_dim=embed_dim,
-                    out_dim=cfg.ibot.head_n_prototypes,
-                    hidden_dim=cfg.ibot.head_hidden_dim,
-                    bottleneck_dim=cfg.ibot.head_bottleneck_dim,
-                    nlayers=cfg.ibot.head_nlayers,
-                )
-                student_model_dict["ibot_head"] = ibot_head()
-            else:
-                logger.info("OPTIONS -- IBOT -- head shared with DINO")
-
         self.need_to_synchronize_fsdp_streams = True
 
-        # ---------- 修改 1：空间感知的子图特征聚合（替代原来的 patch mean）----------
-        agg_hidden = cfg.gcn.spatial_agg_hidden
-        agg_pool = cfg.gcn.spatial_agg_pool_size
-        self.spatial_agg_out_dim = agg_hidden * agg_pool * agg_pool
+        # One WSI image patch remains one GNN node. Raw 2-D DINO tokens are
+        # aggregated inside that patch and fused with its global CLS feature.
         student_model_dict["spatial_agg"] = SpatialPatchAggregator(
-            in_dim=cfg.dino.head_n_prototypes,
-            hidden_dim=agg_hidden,
-            pool_size=agg_pool,
+            in_dim=embed_dim,
+            hidden_dim=cfg.gcn.spatial_agg_hidden,
+            out_dim=cfg.gcn.emb_dim,
         )
-        # node feature = [global CLS mean, local CLS mean, 空间聚合特征] -> MLP
-        student_model_dict["mlp"] = nn.Sequential(
-            nn.Linear(cfg.dino.head_n_prototypes * 2 + self.spatial_agg_out_dim, 2048),
-            nn.ReLU(inplace=True),
-            nn.Linear(2048, cfg.gcn.emb_dim)
+        student_model_dict["node_fusion"] = NodeFeatureFusion(
+            global_dim=embed_dim,
+            out_dim=cfg.gcn.emb_dim,
+            spatial_scale_init=cfg.gcn.spatial_fusion_alpha,
         )
         student_model_dict["gcn"] = GNN(
             cfg.gcn.num_layer,
@@ -232,6 +192,12 @@ class GCNMetaArch(nn.Module):
             gnn_type=cfg.gcn.gnn_type,
             edge_dim=3
         )
+        student_model_dict["mask_token"] = LearnableMaskToken(cfg.gcn.emb_dim)
+        student_model_dict["node_decoder"] = nn.Sequential(
+            nn.Linear(cfg.gcn.emb_dim, cfg.gcn.emb_dim),
+            nn.GELU(),
+            nn.Linear(cfg.gcn.emb_dim, cfg.gcn.emb_dim),
+        )
 
         # ---------- 修改 3：Graph Context Contrastive 投影头 ----------
         student_model_dict["projection"] = nn.Sequential(
@@ -240,19 +206,22 @@ class GCNMetaArch(nn.Module):
             nn.Linear(cfg.gcn.emb_dim, cfg.gcn.contrast_proj_dim),
         )
 
-        # ---------- 修改 2：两阶段 Edge Learning 预测头 ----------
-        # 第一阶段：Edge Existence Prediction，预测 P(E_ij = 1)
+        # Symmetric pair representation: [h_i+h_j, |h_i-h_j|, h_i*h_j].
+        pair_dim = cfg.gcn.emb_dim * 3
         student_model_dict["edge_existence_head"] = nn.Sequential(
-            nn.Linear(cfg.gcn.emb_dim * 2, cfg.gcn.emb_dim),
-            nn.ReLU(inplace=True),
+            nn.Linear(pair_dim, cfg.gcn.emb_dim),
+            nn.GELU(),
             nn.Linear(cfg.gcn.emb_dim, 1),
         )
-        # 第二阶段：Edge Type Prediction，仅在 E_ij = 1 时预测边类型
-        # 0 = Spatial, 1 = Semantic, 2 = Spatial + Semantic
         student_model_dict["edge_type_head"] = nn.Sequential(
-            nn.Linear(cfg.gcn.emb_dim * 2, cfg.gcn.emb_dim),
-            nn.ReLU(inplace=True),
+            nn.Linear(pair_dim, cfg.gcn.emb_dim),
+            nn.GELU(),
             nn.Linear(cfg.gcn.emb_dim, 3),
+        )
+        student_model_dict["edge_weight_head"] = nn.Sequential(
+            nn.Linear(pair_dim, cfg.gcn.emb_dim),
+            nn.GELU(),
+            nn.Linear(cfg.gcn.emb_dim, 2),
         )
 
         self.student = nn.ModuleDict(student_model_dict)
@@ -267,10 +236,10 @@ class GCNMetaArch(nn.Module):
             )
         self._dino_raw_results = {}
 
-        student_dtype = next(self.student.backbone.parameters()).dtype
-
-        
-        logger.info(f"Student and GCN are built: they are both {cfg.student.arch} network.")
+        logger.info(
+            "DINO backbone and graph pretraining heads are built with %d-D node features",
+            cfg.gcn.emb_dim,
+        )
 
     def forward(self, inputs):
         raise NotImplementedError
@@ -283,89 +252,35 @@ class GCNMetaArch(nn.Module):
     
     def dino_encoder(self, images):
         n_global_crops = 2
-        assert n_global_crops == 2
-        batch_size = int(images["collated_global_crops"].shape[0]/n_global_crops)
-        n_local_crops = self.cfg.crops.local_crops_number
-        
+        batch_size = images["collated_global_crops"].shape[0] // n_global_crops
         global_crops = images["collated_global_crops"].cuda(non_blocking=True)
-        local_crops = images["collated_local_crops"].cuda(non_blocking=True)
-
-        student_global_backbone_output_dict, student_local_backbone_output_dict = self.student.backbone(
-            [global_crops, local_crops], masks=[None, None], is_training=True
+        global_output = self.student.backbone(
+            global_crops, masks=None, is_training=True
+        )
+        global_cls = global_output["x_norm_clstoken"].view(
+            n_global_crops, batch_size, self.embed_dim
+        )
+        raw_patch_tokens = global_output["x_norm_patchtokens"]
+        num_tokens = raw_patch_tokens.shape[1]
+        raw_patch_tokens = raw_patch_tokens.view(
+            n_global_crops, batch_size, num_tokens, self.embed_dim
         )
 
-        inputs_for_student_head_list = []
-
-        # 1a: local crops cls tokens
-        student_local_cls_tokens = student_local_backbone_output_dict["x_norm_clstoken"]
-        
-        inputs_for_student_head_list.append(student_local_cls_tokens.unsqueeze(0))
-
-        # 1b: global crops cls tokens
-        student_global_cls_tokens = student_global_backbone_output_dict["x_norm_clstoken"]
-        
-        inputs_for_student_head_list.append(student_global_cls_tokens.unsqueeze(0))
-
-        # 1c: global crops patch tokens
-        if self.do_ibot:
-            _dim = student_global_backbone_output_dict["x_norm_clstoken"].shape[-1]
-            B = student_global_backbone_output_dict["x_norm_patchtokens"].shape[0]
-            num_tokens = student_global_backbone_output_dict["x_norm_patchtokens"].shape[1]
-            ibot_student_patch_tokens = student_global_backbone_output_dict["x_norm_patchtokens"].flatten(0, 1)
-
-            if not self.ibot_separate_head:
-                
-                inputs_for_student_head_list.append(ibot_student_patch_tokens.unsqueeze(0))
-            else:
-                student_global_masked_patch_tokens_after_head = self.student.ibot_head(ibot_student_patch_tokens)
-
-        # 2: run
-        _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_for_student_head_list)
-        outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
-
-        # 3a: local crops cls tokens
-        student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
-
-        # 3b: global crops cls tokens
-        student_global_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
-
-        # 3c: global crops patch tokens
-        if self.do_ibot and not self.ibot_separate_head:
-            student_global_masked_patch_tokens_after_head = outputs_list.pop(0).squeeze(0)
-
-        student_global_cls_tokens_after_head = student_global_cls_tokens_after_head.view(n_global_crops,batch_size,-1)
-        student_local_cls_tokens_after_head = student_local_cls_tokens_after_head.view(n_local_crops,batch_size,-1)
-        student_global_masked_patch_tokens_after_head = student_global_masked_patch_tokens_after_head.view((n_global_crops,batch_size,num_tokens,-1))
-
-        student_global_mean_feat = student_global_cls_tokens_after_head.mean(dim=0)
-        student_local_mean_feat = student_local_cls_tokens_after_head.mean(dim=0)
-
-        # 修改 1：不再对 patch feature 简单 mean，
-        # 而是重排成空间网格后做多尺度 Depthwise Conv + 池化，保留局部空间结构
-        # [n_global_crops, B, T, C] -> [n_global_crops*B, T, C]
-        global_patch_grid_feat = self.student.spatial_agg(
-            student_global_masked_patch_tokens_after_head.flatten(0, 1).float()
-        )
-        student_global_patch_spatial_feat = global_patch_grid_feat.view(
+        global_feature = global_cls.mean(dim=0)
+        spatial_feature = self.student.spatial_agg(
+            raw_patch_tokens.flatten(0, 1).float()
+        ).view(
             n_global_crops, batch_size, -1
-        ).mean(dim=0).to(student_global_mean_feat.dtype)
+        ).mean(dim=0).to(global_feature.dtype)
+        node_features = self.student.node_fusion(global_feature, spatial_feature)
 
-        cat_feat = torch.cat(
-            [student_global_mean_feat, student_local_mean_feat, student_global_patch_spatial_feat],
-            dim=-1,
-        )
-
-        node_features = self.student.mlp(cat_feat)
-
-        # 收集 DINO 处理后的原始结果，供容器落盘（均为进入 GCN 前的特征）
         if self.dino_feature_container is not None:
             self._dino_raw_results = {
-                "global_cls_after_head": student_global_cls_tokens_after_head,   # [2, B, head_dim]
-                "local_cls_after_head": student_local_cls_tokens_after_head,     # [n_local, B, head_dim]
-                "global_patch_after_head": student_global_masked_patch_tokens_after_head,  # [2, B, T, head_dim]
-                "global_patch_spatial_feat": student_global_patch_spatial_feat,  # [B, agg_dim] 修改1的空间聚合输出
-                "cat_feat": cat_feat,                                            # [B, 2*head_dim+agg_dim]
-                "node_features": node_features,                                  # [B, emb_dim]
+                "global_cls": global_cls,
+                "global_patch_tokens": raw_patch_tokens,
+                "global_feature": global_feature,
+                "spatial_feature": spatial_feature,
+                "node_features": node_features,
             }
         return node_features
         
@@ -394,16 +309,18 @@ class GCNMetaArch(nn.Module):
         src, dst = src[keep], dst[keep]
 
         undirected_pairs = torch.stack([src, dst], dim=1)  # [M, 2]
-        d = dist_matrix[src, dst] / radius  # 距离按 radius 归一化，数值更稳定
-        s = sim_matrix[src, dst]
-        edge_attr_half = torch.stack([d, s, torch.zeros_like(d)], dim=1)  # [M, 3]
+        spatial_weight = 1.0 - dist_matrix[src, dst] / radius
+        semantic_weight = sim_matrix[src, dst]
+        edge_attr_half = torch.stack(
+            [spatial_weight, semantic_weight, torch.zeros_like(spatial_weight)], dim=1
+        )
 
         edge_index = torch.cat([torch.stack([src, dst]), torch.stack([dst, src])], dim=1)
         edge_attr = torch.cat([edge_attr_half, edge_attr_half], dim=0)
         return edge_index, edge_attr, undirected_pairs, coords
 
     def sample_view_masks(self, num_undirected_edges, device):
-        """修改 3.4：对同一空间图随机丢边，生成两个不同的 Graph View。"""
+        """Optionally drop a very small number of edges in a weak view."""
         drop = self.cfg.gcn.view_edge_drop
         masks = []
         for _ in range(2):
@@ -421,23 +338,159 @@ class GCNMetaArch(nn.Module):
         keep_full = torch.cat([keep_mask, keep_mask])
         return edge_index[:, keep_full], edge_attr[keep_full]
 
-    def graph_context_contrastive_loss(self, h1, h2):
-        """修改 3.4/3.6：节点级 InfoNCE。
+    def make_noisy_view(self, node_features, edge_index, edge_attr, num_pairs):
+        """Create a weak view while preserving the underlying tissue graph."""
+        feature_noise = torch.randn_like(node_features) * self.cfg.gcn.feature_noise_std
+        view_features = node_features + feature_noise
 
-        Positive：同一节点在两个 Graph View 下的 context-aware 表示；
-        Negative：图内其它（语义/空间上不同的）节点，
-        避免所有节点退化成相同 embedding。
-        """
-        N = h1.shape[0]
-        if N < 2:
+        feature_mask_ratio = self.cfg.gcn.contrast_feature_mask_ratio
+        if feature_mask_ratio > 0:
+            keep = torch.rand_like(view_features) >= feature_mask_ratio
+            view_features = view_features * keep.to(view_features.dtype)
+
+        view_attr = edge_attr.clone()
+        if view_attr.numel() > 0 and self.cfg.gcn.edge_weight_noise_std > 0:
+            # The last channel is a self-loop marker and must not be perturbed.
+            noise = torch.randn_like(view_attr[:, :2]) * self.cfg.gcn.edge_weight_noise_std
+            view_attr[:, :2] = view_attr[:, :2] * (1.0 + noise)
+            view_attr[:, 0].clamp_(min=0.0)
+            view_attr[:, 1].clamp_(min=-1.0, max=1.0)
+
+        keep_mask = self.sample_view_masks(num_pairs, node_features.device)[0]
+        view_index, view_attr = self.apply_view_mask(edge_index, view_attr, keep_mask)
+        return view_features, view_index, view_attr
+
+    def reliable_negative_mask(self, coords, visual_h, context_h, undirected_pairs=None):
+        """Only mark pairs that are far and dissimilar in both semantic spaces."""
+        num_nodes = visual_h.shape[0]
+        if num_nodes < 2:
+            return torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=visual_h.device)
+        with torch.no_grad():
+            distance = torch.cdist(coords.float(), coords.float())
+            visual_sim = F.cosine_similarity(
+                visual_h.unsqueeze(1), visual_h.unsqueeze(0), dim=-1
+            )
+            context_sim = F.cosine_similarity(
+                context_h.unsqueeze(1), context_h.unsqueeze(0), dim=-1
+            )
+            mask = (
+                (
+                    distance
+                    >= self.cfg.gcn.spatial_radius
+                    * self.cfg.gcn.reliable_neg_distance_ratio
+                )
+                & (visual_sim <= self.cfg.gcn.reliable_neg_visual_sim_max)
+                & (context_sim <= self.cfg.gcn.reliable_neg_context_sim_max)
+            )
+            mask.fill_diagonal_(False)
+            if undirected_pairs is not None and undirected_pairs.numel() > 0:
+                mask[undirected_pairs[:, 0], undirected_pairs[:, 1]] = False
+                mask[undirected_pairs[:, 1], undirected_pairs[:, 0]] = False
+        return mask
+
+    def graph_context_contrastive_loss(self, h1, h2, reliable_negatives):
+        """Masked InfoNCE: other nodes are negatives only when they are reliable."""
+        num_nodes = h1.shape[0]
+        if num_nodes == 0:
             return h1.sum() * 0.0
-        z1 = F.normalize(self.student.projection(h1), dim=-1)
-        z2 = F.normalize(self.student.projection(h2), dim=-1)
+        z1 = F.normalize(self.student.projection(h1).float(), dim=-1)
+        z2 = F.normalize(self.student.projection(h2).float(), dim=-1)
         tau = self.cfg.gcn.contrast_temperature
         logits = z1 @ z2.t() / tau
-        labels = torch.arange(N, device=z1.device)
-        loss = (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels)) / 2
-        return loss
+        allowed = reliable_negatives | torch.eye(num_nodes, dtype=torch.bool, device=z1.device)
+        labels = torch.arange(num_nodes, device=z1.device)
+        forward_loss = F.cross_entropy(logits.masked_fill(~allowed, float("-inf")), labels)
+        backward_loss = F.cross_entropy(
+            logits.t().masked_fill(~allowed.t(), float("-inf")), labels
+        )
+        alignment = (1.0 - (z1 * z2).sum(dim=-1)).mean()
+        return (
+            (forward_loss + backward_loss) * 0.5
+            + self.cfg.gcn.contrast_alignment_weight * alignment
+        )
+
+    def _mask_target_count(self, num_nodes):
+        if num_nodes < 2:
+            return 0
+        requested = max(1, round(num_nodes * self.cfg.gcn.node_mask_ratio))
+        return min(num_nodes - 1, requested)
+
+    def sample_node_reconstruction_masks(self, coords, undirected_pairs):
+        """Return exact-ratio random, spatial-region, and random-walk masks."""
+        num_nodes = coords.shape[0]
+        device = coords.device
+        target = self._mask_target_count(num_nodes)
+        empty = torch.zeros(num_nodes, dtype=torch.bool, device=device)
+        if target == 0:
+            return {"random": empty, "region": empty.clone(), "random_walk": empty.clone()}
+
+        random_mask = empty.clone()
+        random_mask[torch.randperm(num_nodes, device=device)[:target]] = True
+
+        # A nearest-neighbour region around one random seed is spatially contiguous
+        # and always reaches the requested mask ratio.
+        seed = torch.randint(num_nodes, (1,), device=device)
+        seed_distance = torch.cdist(coords[seed].float(), coords.float()).squeeze(0)
+        region_mask = empty.clone()
+        region_mask[seed_distance.argsort()[:target]] = True
+
+        adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.bool, device=device)
+        if undirected_pairs.numel() > 0:
+            adjacency[undirected_pairs[:, 0], undirected_pairs[:, 1]] = True
+            adjacency[undirected_pairs[:, 1], undirected_pairs[:, 0]] = True
+        walk_mask = empty.clone()
+        current = torch.randint(num_nodes, (1,), device=device).squeeze(0)
+        stagnant_steps = 0
+        while int(walk_mask.sum()) < target:
+            previous_count = int(walk_mask.sum())
+            walk_mask[current] = True
+            neighbours = adjacency[current].nonzero(as_tuple=False).flatten()
+            if neighbours.numel() == 0 or stagnant_steps >= max(4, num_nodes):
+                remaining = (~walk_mask).nonzero(as_tuple=False).flatten()
+                if remaining.numel() == 0:
+                    break
+                current = remaining[
+                    torch.randint(remaining.numel(), (1,), device=device)
+                ].squeeze(0)
+                stagnant_steps = 0
+                continue
+            current = neighbours[
+                torch.randint(neighbours.numel(), (1,), device=device)
+            ].squeeze(0)
+            stagnant_steps = stagnant_steps + 1 if previous_count == int(walk_mask.sum()) else 0
+
+        # A disconnected graph may force restarts; trim only as a safety guard.
+        if int(walk_mask.sum()) > target:
+            selected = walk_mask.nonzero(as_tuple=False).flatten()[:target]
+            walk_mask.zero_()
+            walk_mask[selected] = True
+        return {"random": random_mask, "region": region_mask, "random_walk": walk_mask}
+
+    def node_reconstruction_losses(self, node_features, edge_index, edge_attr, masks):
+        losses = {}
+        zero = node_features.sum() * 0.0
+        for name, mask in masks.items():
+            if not mask.any():
+                losses[name] = zero
+                continue
+            masked_features = self.student.mask_token(node_features, mask)
+            context = self.student.gcn(masked_features, edge_index, edge_attr)
+            prediction = self.student.node_decoder(context[mask])
+            target = node_features.detach()[mask]
+            mse = F.mse_loss(prediction.float(), target.float())
+            cosine = (1.0 - F.cosine_similarity(prediction.float(), target.float(), dim=-1)).mean()
+            losses[name] = (
+                self.cfg.gcn.node_recon_mse_weight * mse
+                + self.cfg.gcn.node_recon_cos_weight * cosine
+            )
+        combined = torch.stack(list(losses.values())).mean() if losses else zero
+        return combined, losses
+
+    @staticmethod
+    def pair_features(node_representation, pairs):
+        left = node_representation[pairs[:, 0]]
+        right = node_representation[pairs[:, 1]]
+        return torch.cat([left + right, (left - right).abs(), left * right], dim=-1)
 
     def add_semantic_edges(self, context_h, edge_index, edge_attr, undirected_pairs, coords):
         """修改 3 的出口：用 context-aware 特征的相似度发现潜在语义关系。
@@ -483,80 +536,73 @@ class GCNMetaArch(nn.Module):
 
         if idx.shape[0] > 0:
             si, sj = idx[:, 0], idx[:, 1]
-            d = torch.sqrt(((coords[si] - coords[sj]) ** 2).sum(-1)) / radius
-            s = sim[si, sj].detach()
-            new_attr = torch.stack([d, s, torch.zeros_like(d)], dim=1)
-            # 插入后保持约定：前一半 = (i, j)，后一半 = (j, i)
-            edge_index = torch.cat(
-                [edge_index[:, :M], torch.stack([si, sj]), torch.stack([sj, si]), edge_index[:, M:]],
-                dim=1,
+            distance = torch.sqrt(((coords[si] - coords[sj]) ** 2).sum(-1))
+            spatial_weight = (1.0 - distance / radius).clamp(min=0.0)
+            semantic_weight = sim[si, sj].detach()
+            new_attr = torch.stack(
+                [spatial_weight, semantic_weight, torch.zeros_like(spatial_weight)], dim=1
             )
-            edge_attr = torch.cat([edge_attr[:M], new_attr, new_attr, edge_attr[M:]], dim=0)
+            edge_attr_half = torch.cat([edge_attr[:M], new_attr], dim=0)
             undirected_pairs = torch.cat([undirected_pairs, idx], dim=0)
+            src, dst = undirected_pairs[:, 0], undirected_pairs[:, 1]
+            # Preserve the invariant used by every graph masking operation:
+            # first half forward pairs, second half the same pairs reversed.
+            edge_index = torch.cat(
+                [torch.stack([src, dst]), torch.stack([dst, src])], dim=1
+            )
+            edge_attr = torch.cat([edge_attr_half, edge_attr_half], dim=0)
             type_labels = torch.cat(
                 [type_labels, torch.ones(idx.shape[0], dtype=torch.long, device=device)]
             )
         return edge_index, edge_attr, undirected_pairs, type_labels
 
-    def mask_edges_and_sample_negatives(self, N, edge_index, edge_attr, undirected_pairs, type_labels):
-        """修改 2 的数据准备：mask 一部分边作为待预测样本，并采样真正的负样本节点对。
-
-        正样本：被 mask 掉的边（E_ij = 1）
-        负样本：图中本来就没有任何边的节点对（E_ij = 0），
-                让 existence prediction 拥有真正的正负样本。
-        """
+    def mask_edges_and_sample_negatives(
+        self, edge_index, edge_attr, undirected_pairs, type_labels, reliable_negatives
+    ):
+        """Mask positive edges and sample only explicitly reliable non-edges."""
         device = edge_index.device
-        M = undirected_pairs.shape[0]
+        num_edges = undirected_pairs.shape[0]
 
-        num_mask = min(M, max(1, int(M * self.cfg.gcn.edge_mask_ratio))) if M > 0 else 0
-        perm = torch.randperm(M, device=device)
+        num_mask = (
+            min(num_edges, max(1, round(num_edges * self.cfg.gcn.edge_mask_ratio)))
+            if num_edges > 0
+            else 0
+        )
+        perm = torch.randperm(num_edges, device=device)
         mask_sel = perm[:num_mask]
-        keep_mask = torch.ones(M, dtype=torch.bool, device=device)
+        keep_mask = torch.ones(num_edges, dtype=torch.bool, device=device)
         keep_mask[mask_sel] = False
 
         masked_edge_index, masked_edge_attr = self.apply_view_mask(edge_index, edge_attr, keep_mask)
-        masked_pairs = undirected_pairs[mask_sel]          # [num_mask, 2]
-        masked_type_labels = type_labels[mask_sel]         # [num_mask]
+        masked_pairs = undirected_pairs[mask_sel]
+        masked_type_labels = type_labels[mask_sel]
+        masked_edge_targets = edge_attr[:num_edges][mask_sel, :2]
 
-        # 负样本：不存在任何边的节点对（基于 mask 前的完整边集，避免和正样本重叠）
-        num_neg = self.cfg.gcn.num_neg_pairs
-        if N >= 2 and num_neg > 0:
-            adj = torch.zeros(N, N, dtype=torch.bool, device=device)
-            if M > 0:
-                adj[undirected_pairs[:, 0], undirected_pairs[:, 1]] = True
-                adj[undirected_pairs[:, 1], undirected_pairs[:, 0]] = True
-            neg_chunks = []
-            total = 0
-            tries = 0
-            while total < num_neg and tries < 100:
-                tries += 1
-                need = num_neg - total
-                i = torch.randint(0, N, (need * 4,), device=device)
-                j = torch.randint(0, N, (need * 4,), device=device)
-                valid = (i != j) & (~adj[i, j])
-                pairs = torch.stack([i[valid], j[valid]], dim=1)[:need]
-                if pairs.shape[0] > 0:
-                    neg_chunks.append(pairs)
-                    total += pairs.shape[0]
-            neg_pairs = (
-                torch.cat(neg_chunks, dim=0)
-                if neg_chunks
-                else torch.zeros((0, 2), dtype=torch.long, device=device)
-            )
-        else:
-            neg_pairs = torch.zeros((0, 2), dtype=torch.long, device=device)
+        candidates = torch.triu(reliable_negatives, diagonal=1).nonzero(as_tuple=False)
+        if candidates.shape[0] > 0:
+            candidates = candidates[torch.randperm(candidates.shape[0], device=device)]
+        max_negatives = self.cfg.gcn.num_neg_pairs
+        if num_mask > 0:
+            max_negatives = min(max_negatives, num_mask * self.cfg.gcn.negatives_per_positive)
+        neg_pairs = candidates[:max_negatives]
 
-        return masked_edge_index, masked_edge_attr, masked_pairs, masked_type_labels, neg_pairs
+        return (
+            masked_edge_index,
+            masked_edge_attr,
+            masked_pairs,
+            masked_type_labels,
+            masked_edge_targets,
+            neg_pairs,
+        )
 
     def forward_backward(self, images):
         loss_dict = {}
-        loss_accumulator = 0  # for backprop
 
-        ### 修改 1：DINO encoder + 空间感知聚合 -> 子图级 node feature
+        # 1) One image patch -> one spatially aggregated DINO node feature.
         node_features = self.dino_encoder(images)
+        zero = node_features.sum() * 0.0
         coords = images["coords"]
         if coords.shape[0] == 2 * node_features.shape[0]:
-            # 兼容每个子图给出两个 global crop 坐标的情况，取均值
             coords = coords.view(2, node_features.shape[0], 2).mean(dim=0)
 
         ### DINO 原始结果保存：将本次前向的原始特征连同坐标 / slide 名落盘
@@ -566,56 +612,96 @@ class GCNMetaArch(nn.Module):
                 meta={"coords": coords, "slide_name": images.get("slide_name")},
             )
 
-        ### 修改 3.2：仅根据 WSI 坐标建立初始空间图
+        # Initial graph is spatial only; DINO similarity is an edge attribute,
+        # not a criterion for whether the initial edge exists.
         edge_index, edge_attr, undirected_pairs, coords = self.build_spatial_graph(node_features, coords)
 
-        ### 修改 3.3/3.4：两个 Graph View -> GNN -> Graph Context Contrastive Learning
-        view_mask1, view_mask2 = self.sample_view_masks(undirected_pairs.shape[0], node_features.device)
-        h1 = self.student.gcn(node_features, *self.apply_view_mask(edge_index, edge_attr, view_mask1))
-        h2 = self.student.gcn(node_features, *self.apply_view_mask(edge_index, edge_attr, view_mask2))
-        contrast_loss = self.graph_context_contrastive_loss(h1, h2)
+        # 2) Graph-MAE: all three masks use the same learned mask token and
+        # node reconstruction head, with both MSE and cosine objectives.
+        node_masks = self.sample_node_reconstruction_masks(coords, undirected_pairs)
+        node_recon_loss, _ = self.node_reconstruction_losses(
+            node_features, edge_index, edge_attr, node_masks
+        )
 
-        ### 修改 3 出口：context-aware 相似度 -> 潜在语义边（可能空间上很远）
+        # 3) Two weak noisy views preserve topology by default. Feature/edge
+        # noise and a small channel mask provide the contrastive perturbation.
+        view1 = self.make_noisy_view(
+            node_features, edge_index, edge_attr, undirected_pairs.shape[0]
+        )
+        view2 = self.make_noisy_view(
+            node_features, edge_index, edge_attr, undirected_pairs.shape[0]
+        )
+        h1 = self.student.gcn(*view1)
+        h2 = self.student.gcn(*view2)
         context_h = (h1 + h2) / 2
+        contrast_negatives = self.reliable_negative_mask(
+            coords, node_features.detach(), context_h.detach(), undirected_pairs
+        )
+        contrast_loss = self.graph_context_contrastive_loss(
+            h1, h2, contrast_negatives
+        )
+
+        # Context-aware similarity provides provisional semantic relation labels.
         edge_index, edge_attr, undirected_pairs, edge_type_labels = self.add_semantic_edges(
             context_h, edge_index, edge_attr, undirected_pairs, coords
         )
 
-        ### 修改 2：Mask Graph -> GNN -> Edge Existence -> Edge Type
-        (masked_edge_index, masked_edge_attr, masked_pairs,
-         masked_type_labels, neg_pairs) = self.mask_edges_and_sample_negatives(
-            node_features.shape[0], edge_index, edge_attr, undirected_pairs, edge_type_labels
+        # 4) Edge learning first predicts existence with positive and reliable
+        # negative pairs, then relation type and continuous attributes for positives.
+        edge_negatives = self.reliable_negative_mask(
+            coords, node_features.detach(), context_h.detach(), undirected_pairs
+        )
+        (
+            masked_edge_index,
+            masked_edge_attr,
+            masked_pairs,
+            masked_type_labels,
+            masked_edge_targets,
+            neg_pairs,
+        ) = self.mask_edges_and_sample_negatives(
+            edge_index,
+            edge_attr,
+            undirected_pairs,
+            edge_type_labels,
+            edge_negatives,
         )
         node_rep = self.student.gcn(node_features, masked_edge_index, masked_edge_attr)
 
-        # 第一阶段：Edge Existence Prediction（正样本 = 被 mask 的边，负样本 = 无边节点对）
         all_pairs = torch.cat([masked_pairs, neg_pairs], dim=0)
-        if all_pairs.shape[0] > 0:
+        # Existence is a binary task only when both classes are available.
+        # Uncertain non-edges are deliberately not used as fallback negatives.
+        if masked_pairs.shape[0] > 0 and neg_pairs.shape[0] > 0:
             exist_label = torch.cat([
                 torch.ones(masked_pairs.shape[0], device=node_rep.device),
                 torch.zeros(neg_pairs.shape[0], device=node_rep.device),
             ])
-            edge_rep = torch.cat([node_rep[all_pairs[:, 0]], node_rep[all_pairs[:, 1]]], dim=-1)
+            edge_rep = self.pair_features(node_rep, all_pairs)
             exist_logits = self.student.edge_existence_head(edge_rep).squeeze(-1)
             existence_loss = F.binary_cross_entropy_with_logits(exist_logits, exist_label)
         else:
-            existence_loss = node_features.sum() * 0.0
+            existence_loss = zero
 
-        # 第二阶段：Edge Type Prediction，仅对 E_ij = 1 的边预测（训练时用真值正边）
         if masked_pairs.shape[0] > 0:
-            pos_rep = torch.cat([node_rep[masked_pairs[:, 0]], node_rep[masked_pairs[:, 1]]], dim=-1)
+            pos_rep = self.pair_features(node_rep, masked_pairs)
             type_logits = self.student.edge_type_head(pos_rep)
             type_loss = F.cross_entropy(type_logits, masked_type_labels)
+            predicted_edge_weights = self.student.edge_weight_head(pos_rep)
+            edge_weight_loss = F.mse_loss(
+                predicted_edge_weights.float(), masked_edge_targets.float()
+            )
         else:
-            type_loss = node_features.sum() * 0.0
+            type_loss = zero
+            edge_weight_loss = zero
 
-        loss_accumulator += contrast_loss * self.cfg.gcn.contrast_weight
-        loss_accumulator += existence_loss
-        loss_accumulator += type_loss
-
-        loss_dict["graph_contrastive"] = contrast_loss.detach()
-        loss_dict["edge_existence"] = existence_loss.detach()
-        loss_dict["edge_type"] = type_loss.detach()
+        weighted_losses = {
+            "node_reconstruction": node_recon_loss * self.cfg.gcn.node_recon_weight,
+            "graph_contrastive": contrast_loss * self.cfg.gcn.contrast_weight,
+            "edge_existence": existence_loss * self.cfg.gcn.edge_existence_weight,
+            "edge_relation": type_loss * self.cfg.gcn.edge_relation_weight,
+            "edge_weight": edge_weight_loss * self.cfg.gcn.edge_weight_weight,
+        }
+        loss_accumulator = sum(weighted_losses.values(), zero)
+        loss_dict.update({name: loss.detach() for name, loss in weighted_losses.items()})
 
         self.backprop_loss(loss_accumulator)
         self.fsdp_synchronize_streams()
@@ -625,7 +711,10 @@ class GCNMetaArch(nn.Module):
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
-            self.student.dino_head._streams = self.student.backbone._streams
+            backbone_streams = self.student.backbone._streams
+            for name, module in self.student.items():
+                if name != "backbone" and hasattr(module, "_streams"):
+                    module._streams = backbone_streams
             self.need_to_synchronize_fsdp_streams = False
 
     def train(self):
@@ -659,4 +748,3 @@ class GCNMetaArch(nn.Module):
             print(k)
             student_model_cfg = self.cfg.compute_precision.student[k]
             self.student[k] = get_fsdp_wrapper(student_model_cfg, modules_to_wrap={BlockChunk})(self.student[k])
-

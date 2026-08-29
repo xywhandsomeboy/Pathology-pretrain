@@ -9,13 +9,13 @@ compute_precision:
         param_dtype: fp16
         reduce_dtype: fp16
         buffer_dtype: fp32
-    dino_head:
+    spatial_agg:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp16
         reduce_dtype: fp32
         buffer_dtype: fp32
-    ibot_head:
+    node_fusion:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp16
@@ -39,6 +39,13 @@ ibot:
   head_bottleneck_dim: 256
   head_nlayers: 3
   head_hidden_dim: 2048
+feature:
+  # One extracted image patch becomes one 1024-D graph node in Stage 2.
+  out_dim: 1024
+  spatial_agg_hidden: 256
+  spatial_fusion_alpha: 0.1
+  # Prevent final .npz extraction with a randomly initialized spatial branch.
+  require_trained_spatial: true
 train:
   batch_size_per_gpu: 64
   dataset_path: ImageNet:split=TRAIN
