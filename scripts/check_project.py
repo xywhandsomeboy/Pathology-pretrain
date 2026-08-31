@@ -21,6 +21,7 @@ ACTIVE_FILES = (
     "dinov2_stage2_2_FmH2ST/dinov2/data/datasets/image_folder.py",
     "dinov2_stage2_2_FmH2ST/dinov2/train/gcn_meta_arch.py",
     "dinov2_stage2_2_FmH2ST/experiments/stage2_variants/summarize_runs.py",
+    "scripts/compare_stage1_checkpoints.py",
     "dinov2_segmentation/data/feature_store.py",
     "dinov2_segmentation/data/manifest_dataset.py",
     "dinov2_segmentation/build_manifest.py",
