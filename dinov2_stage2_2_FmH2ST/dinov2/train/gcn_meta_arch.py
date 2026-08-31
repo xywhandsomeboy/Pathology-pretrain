@@ -286,8 +286,7 @@ class GCNMetaArch(nn.Module):
             raise ValueError(
                 f"Expected {self.cfg.gcn.edge_dim}-D edge_attr, got "
                 f"{graph.edge_attr.size(-1)}. Rebuild old .pt graphs with "
-                "dinov2.data.datasets.graph_builder so spatial and semantic "
-                "weights are stored separately."
+                "build_graphs.py using the edge mode required by this variant."
             )
         pairs = self._unique_pairs(graph.edge_index)
         node_loss, details = self._node_reconstruction(graph, pairs)

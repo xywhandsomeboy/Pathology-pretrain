@@ -9,6 +9,7 @@ tokens deliberately remain outside PyG graph files.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -53,9 +54,11 @@ def build_all(args) -> tuple[int, int]:
             patch_ids=metadata.get("patch_ids"),
             levels=metadata.get("levels"),
             slide_id=slide_id,
+            edge_mode=args.edge_mode,
         )
         validate_graph_schema(
             graph,
+            expected_edge_dim=2 if args.edge_mode == "dual" else 1,
             require_decoder_metadata=args.require_decoder_metadata,
         )
         temporary_path = output_path.with_suffix(".pt.tmp")
@@ -73,11 +76,58 @@ def main():
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--max-distance", type=float)
     parser.add_argument("--distance-multiplier", type=float, default=3.0)
+    parser.add_argument("--edge-mode", choices=("dual", "spatial"), default="dual")
     parser.add_argument("--require-decoder-metadata", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
+    manifest_path = args.output_dir / "stage2_graph_manifest.json"
+    requested_manifest = {
+        "format_version": 1,
+        "edge_mode": args.edge_mode,
+        "edge_dim": 2 if args.edge_mode == "dual" else 1,
+        "embeddings_dir": str(args.embeddings_dir.expanduser().resolve()),
+        "metadata_dir": (
+            str(args.metadata_dir.expanduser().resolve())
+            if args.metadata_dir is not None
+            else None
+        ),
+        "k": args.k,
+        "max_distance": args.max_distance,
+        "distance_multiplier": args.distance_multiplier,
+        "require_decoder_metadata": args.require_decoder_metadata,
+    }
+    if manifest_path.is_file() and not args.overwrite:
+        existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        mismatches = {
+            key: (existing_manifest.get(key), value)
+            for key, value in requested_manifest.items()
+            if existing_manifest.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(
+                f"Graph output configuration differs from {manifest_path}: {mismatches}. "
+                "Use a new output directory or explicitly pass --overwrite."
+            )
+    elif (
+        args.output_dir.is_dir()
+        and next(args.output_dir.glob("*.pt"), None) is not None
+        and not args.overwrite
+    ):
+        raise FileExistsError(
+            f"Existing graphs in {args.output_dir} lack a manifest; use a new "
+            "directory or explicitly pass --overwrite."
+        )
+
     built, skipped = build_all(args)
+    requested_manifest.update(built=built, skipped=skipped)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    temporary_manifest = manifest_path.with_suffix(".json.tmp")
+    temporary_manifest.write_text(
+        json.dumps(requested_manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary_manifest.replace(manifest_path)
     print(f"Built {built} graphs; skipped {skipped} existing graphs")
 
 

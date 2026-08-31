@@ -71,6 +71,22 @@ PYTHON_BIN=/path/to/python-with-pyg
 GRAPH_ROOT=../Graph/graphs-current \
   PYTHON_BIN="$PYTHON_BIN" bash pretrain.sh
 
+# Stage 2 多版本对比（baseline / spatial_only / spatial_bias）
+# 详细说明见 experiments/stage2_variants/README.md
+EMBEDDINGS_DIR=../Graph/embeddings-current \
+  METADATA_DIR=../Graph/embeddings-current \
+  PYTHON_BIN="$PYTHON_BIN" \
+  bash experiments/stage2_variants/prepare_graphs.sh baseline
+EMBEDDINGS_DIR=../Graph/embeddings-current \
+  METADATA_DIR=../Graph/embeddings-current \
+  PYTHON_BIN="$PYTHON_BIN" \
+  bash experiments/stage2_variants/prepare_graphs.sh spatial_only
+
+# 两张空闲 GPU 上同时启动两个独立 Stage 2 版本
+PYTHON_BIN="$PYTHON_BIN" \
+  bash experiments/stage2_variants/run_parallel.sh \
+  comparison_01 baseline spatial_only
+
 # 用合并后的 Stage-2 权重对完整 WSI 图导出节点 context
 "$PYTHON_BIN" export_context.py \
   --config-file dinov2/configs/train/vitl16_short.yaml \

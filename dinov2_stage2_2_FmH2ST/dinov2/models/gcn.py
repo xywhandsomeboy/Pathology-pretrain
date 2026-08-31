@@ -203,6 +203,8 @@ class GATv2Conv(GATConv):
         aggr="add",
         input_layer=False,
         edge_dim=None,
+        edge_injection="message_and_attention",
+        spatial_bias_init=0.0,
     ):
         super().__init__(
             emb_dim=emb_dim,
@@ -213,6 +215,24 @@ class GATv2Conv(GATConv):
             edge_dim=edge_dim,
         )
         self.att = torch.nn.Parameter(torch.empty(1, heads, emb_dim))
+        allowed = {"message_and_attention", "attention_bias"}
+        if edge_injection not in allowed:
+            raise ValueError(
+                f"Unsupported GATv2 edge_injection={edge_injection!r}; "
+                f"expected one of {sorted(allowed)}"
+            )
+        if edge_injection == "attention_bias" and edge_dim != 1:
+            raise ValueError("attention_bias requires a one-dimensional spatial edge_attr")
+        self.edge_injection = edge_injection
+        if edge_injection == "attention_bias":
+            # The spatial-only variant uses the scalar distance affinity as an
+            # additive attention prior; it must not also enter the message value.
+            self.edge_encoder = None
+            self.spatial_beta = torch.nn.Parameter(
+                torch.tensor(float(spatial_bias_init))
+            )
+        else:
+            self.spatial_beta = None
         self.reset_parameters()
 
     def forward(self, x, edge_index, edge_attr):
@@ -228,23 +248,40 @@ class GATv2Conv(GATConv):
         if self.input_layer:
             x = self.input_node_embeddings(x.to(torch.int64).view(-1))
         x = self.weight_linear(x).view(-1, self.heads, self.emb_dim)
-        edge_embeddings = self.edge_encoder(edge_attr)
+        propagated_edge_attr = (
+            self.edge_encoder(edge_attr)
+            if self.edge_injection == "message_and_attention"
+            else edge_attr
+        )
         return self.propagate(
             edge_index.to(device=x.device, dtype=torch.long),
             x=x,
-            edge_attr=edge_embeddings,
+            edge_attr=propagated_edge_attr,
         )
 
     def message(self, x_i, x_j, edge_attr, edge_index_i, size_i):
-        edge_attr = edge_attr.view(-1, self.heads, self.emb_dim)
-        value = x_j + edge_attr
-        attention_input = x_i + value
+        if self.edge_injection == "message_and_attention":
+            edge_embedding = edge_attr.view(-1, self.heads, self.emb_dim)
+            value = x_j + edge_embedding
+            attention_input = x_i + value
+        else:
+            value = x_j
+            attention_input = x_i + x_j
 
         # GATv2 ordering mixes query and key before the non-linearity, so the
         # neighbor ranking can change with the query node.
         alpha = (
             F.leaky_relu(attention_input, self.negative_slope) * self.att
         ).sum(dim=-1)
+        if self.edge_injection == "attention_bias":
+            spatial_weight = edge_attr.reshape(-1).clamp_min(
+                torch.finfo(edge_attr.dtype).eps
+            )
+            alpha = (
+                alpha
+                + self.spatial_beta.to(alpha.dtype)
+                * spatial_weight.log().unsqueeze(-1)
+            )
         alpha = softmax(alpha, edge_index_i, num_nodes=size_i)
         return value * alpha.unsqueeze(-1)
 
@@ -380,6 +417,8 @@ class GNN(torch.nn.Module):
         block_chunks=1,
         use_residual=True,
         use_layernorm=True,
+        edge_injection="message_and_attention",
+        spatial_bias_init=0.0,
     ):
         super(GNN, self).__init__()
         self.num_layer = num_layer
@@ -405,7 +444,15 @@ class GNN(torch.nn.Module):
             elif gnn_type == "gat":
                 raw_layers.append(GATConv(emb_dim, input_layer=input_layer, edge_dim=edge_dim))
             elif gnn_type == "gatv2":
-                raw_layers.append(GATv2Conv(emb_dim, input_layer=input_layer, edge_dim=edge_dim))
+                raw_layers.append(
+                    GATv2Conv(
+                        emb_dim,
+                        input_layer=input_layer,
+                        edge_dim=edge_dim,
+                        edge_injection=edge_injection,
+                        spatial_bias_init=spatial_bias_init,
+                    )
+                )
             elif gnn_type == "graphsage":
                 raw_layers.append(GraphSAGEConv(emb_dim, input_layer=input_layer))
             else:

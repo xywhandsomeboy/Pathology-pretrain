@@ -1,14 +1,14 @@
-# Stage2 纯空间边备选方案（暂缓实施）
+# Stage2 纯空间边备选方案
 
-状态：**设计备选，当前不实施**
+状态：**已作为隔离实验变体实现，尚未启动训练**
 记录日期：2026-08-31
 
 ## 决策
 
-当前模型结构和正在进行的预训练保持不变。先保留现有模型作为 baseline，
-等当前训练完成并保存 checkpoint、配置与指标后，再通过独立实验分支评估本方案。
+默认模型结构和正在进行的预训练保持不变。当前双通道模型继续作为 baseline；
+纯空间方案只通过 `experiments/stage2_variants` 下的独立配置和输出目录启用。
 
-本文件只记录后续候选改动，不代表这些改动已经进入当前模型。
+这些可选路径不会改变 baseline 的默认数值路径，也尚未生成新图或启动训练。
 
 ## 当前 baseline
 
@@ -112,26 +112,30 @@ message_ij = alpha_ij * W * h_j
 5. 评估是否在写入图文件前将 KNN 边显式对称化。
 6. 自环仍由 GATv2 前向传播时添加，不写入永久图也可以。
 
-## 实施影响
+## 已实现的隔离入口
 
-实施纯空间边方案时至少需要同步修改：
+当前已经通过配置开关完成以下隔离，但尚未运行正式实验：
 
 - `dinov2/data/datasets/graph_builder.py`
-  - 停止计算并保存 `semantic_weight`；
-  - 将图格式版本升级；
-  - 评估是否显式对称化空间 KNN 边。
+  - `dual` 保存二维空间/语义属性；
+  - `spatial` 只保存一维空间属性；
+  - 两种模式保持相同的空间拓扑。
 - `dinov2/configs/ssl_default_config.yaml`
-  - `edge_dim: 2` 改为 `edge_dim: 1`；
-  - 加入空间偏置方式和 `beta` 初始化配置。
+  - baseline 默认仍为 `edge_dim=2`；
+  - 实验入口可以覆盖边维度和注入方式。
 - `dinov2/models/gcn.py`
-  - 不再将空间边嵌入加到消息值；
-  - 把空间权重作为 attention bias；
-  - 加入可学习 `beta`。
+  - baseline 保留原始的消息/注意力双重注入；
+  - `spatial_bias` 使用带可学习 `beta` 的空间 attention bias。
 - `dinov2/train/gcn_meta_arch.py`
-  - 将边属性校验从二维更新为一维；
-  - 决定是否保留边权重重建代理任务。
+  - 按配置验证一维或二维边属性；
+  - 边权重重建头的输出维度与当前变体一致。
 - `build_graphs.py` 和数据集加载检查
-  - 重新生成并验证新 schema 的图文件。
+  - 根据 `--edge-mode` 生成并验证各自 schema。
+- `experiments/stage2_variants`
+  - 保存三种变体定义、建图入口、单任务入口、双 GPU 并行入口和指标汇总脚本。
+
+尚未启用的后续候选只有坐标物理单位统一和永久图边对称化；这两项不能在未确认
+数据倍率语义前直接实施。
 
 ## checkpoint 与数据兼容性
 
@@ -139,11 +143,11 @@ message_ij = alpha_ij * W * h_j
 - 当前两通道 `.pt` 图不能直接当作新的一通道图继续使用，应重新建图。
 - 当前 Stage2 checkpoint 的 `edge_encoder` 输入维度为 2，与新模型不兼容。
 - 新方案需要从头训练 Stage2，不能把旧 Stage2 checkpoint 当作严格续训点。
-- 不覆盖当前图和结果，建议使用独立目录：
+- 不覆盖当前图和结果，已经使用独立目录：
 
   ```text
-  Graph/graphs-spatial-v2/
-  dinov2/results/stage2_graph_pretrain_spatial_v2/
+  Graph/stage2_variants/{dual,spatial}/
+  dinov2/results/stage2_variants/{baseline,spatial_only,spatial_bias}/
   ```
 
 ## 实验比较
@@ -170,9 +174,9 @@ message_ij = alpha_ij * W * h_j
 - HD95；
 - 不同 WSI 上的稳定性和方差。
 
-## 启动修改前的条件
+## 启动训练前的条件
 
-只有满足以下条件后才开始实现本备选方案：
+只有满足以下条件后才启动本备选方案的正式训练：
 
 1. 当前预训练正常结束；
 2. 当前 checkpoint、完整配置和训练日志已经归档；

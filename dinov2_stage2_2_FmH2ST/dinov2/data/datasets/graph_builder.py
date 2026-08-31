@@ -1,7 +1,8 @@
 """Build WSI patch graphs for Stage 2.
 
-Edges are spatial KNN candidates filtered by a maximum physical distance. Each
-edge stores spatial and semantic weights in separate channels.
+Edges are spatial KNN candidates filtered by a maximum physical distance.
+The baseline stores [spatial_weight, semantic_weight]; spatial variants store
+only [spatial_weight] while preserving the exact same topology.
 """
 
 import numpy as np
@@ -14,7 +15,8 @@ except ImportError:  # Small tests may use the exact torch fallback.
     NearestNeighbors = None
 
 
-GRAPH_FORMAT_VERSION = 1
+GRAPH_FORMAT_VERSION = 2
+EDGE_MODE_DIMS = {"dual": 2, "spatial": 1}
 
 
 def _knn(coords, k, chunk_size=1024):
@@ -69,8 +71,9 @@ def build_graph(
     max_distance=None,
     distance_multiplier=3.0,
     sigma_d=None,
+    edge_mode="dual",
 ):
-    """Return directed edges with [spatial_weight, semantic_weight]."""
+    """Return one spatial topology with the requested edge-attribute schema."""
     coords = np.asarray(coords, dtype=np.float32)
     features = np.asarray(features, dtype=np.float32)
     if coords.ndim != 2 or coords.shape[1] != 2:
@@ -87,10 +90,15 @@ def build_graph(
         raise ValueError("distance_multiplier must be positive")
     if max_distance is not None and float(max_distance) < 0:
         raise ValueError("max_distance must be non-negative")
+    if edge_mode not in EDGE_MODE_DIMS:
+        raise ValueError(
+            f"Unsupported edge_mode={edge_mode!r}; expected one of {sorted(EDGE_MODE_DIMS)}"
+        )
+    edge_dim = EDGE_MODE_DIMS[edge_mode]
     if len(coords) < 2:
         return (
             np.empty((0, 2), dtype=np.int64),
-            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, edge_dim), dtype=np.float32),
         )
 
     k_actual = min(int(k), len(coords) - 1)
@@ -103,8 +111,10 @@ def build_graph(
     if sigma_d is None:
         sigma_d = max(float(max_distance) / 2.0, np.finfo(np.float32).eps)
 
-    norms = np.linalg.norm(features, axis=1, keepdims=True)
-    normalized_features = features / np.maximum(norms, np.finfo(np.float32).eps)
+    normalized_features = None
+    if edge_mode == "dual":
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        normalized_features = features / np.maximum(norms, np.finfo(np.float32).eps)
     edges, attributes = [], []
     for source in range(len(coords)):
         for target, distance in zip(indices[source], distances[source]):
@@ -112,14 +122,17 @@ def build_graph(
                 continue
             spatial_weight = np.exp(-(distance ** 2) / (2.0 * sigma_d ** 2))
             edges.append((source, int(target)))
-            semantic_weight = (
-                float(np.dot(normalized_features[source], normalized_features[target]))
-                + 1.0
-            ) / 2.0
-            attributes.append((spatial_weight, semantic_weight))
+            if edge_mode == "dual":
+                semantic_weight = (
+                    float(np.dot(normalized_features[source], normalized_features[target]))
+                    + 1.0
+                ) / 2.0
+                attributes.append((spatial_weight, semantic_weight))
+            else:
+                attributes.append((spatial_weight,))
     return (
         np.asarray(edges, dtype=np.int64).reshape(-1, 2),
-        np.asarray(attributes, dtype=np.float32).reshape(-1, 2),
+        np.asarray(attributes, dtype=np.float32).reshape(-1, edge_dim),
     )
 
 
@@ -133,6 +146,7 @@ def to_pyg_data(
     dense_tokens=None,
     levels=None,
     slide_id=None,
+    edge_mode=None,
 ):
     count = len(features)
     if patch_ids is not None and len(patch_ids) != count:
@@ -149,6 +163,8 @@ def to_pyg_data(
         y=torch.as_tensor(labels, dtype=torch.long) if labels is not None else None,
     )
     data.graph_format_version = GRAPH_FORMAT_VERSION
+    if edge_mode is not None:
+        data.edge_mode = str(edge_mode)
     data.node_ids = torch.arange(count, dtype=torch.long)
     # These fields preserve the exact Stage-1 -> graph -> raw-patch identity
     # needed by the downstream segmentation decoder.
@@ -166,7 +182,9 @@ def to_pyg_data(
     return data
 
 
-def validate_graph_schema(data, *, require_decoder_metadata=False):
+def validate_graph_schema(
+    data, *, expected_edge_dim=None, require_decoder_metadata=False
+):
     """Validate tensors shared by Stage 2 and the segmentation cache builder."""
     if not isinstance(data, Data):
         raise TypeError(f"Expected torch_geometric.data.Data, got {type(data)}")
@@ -175,10 +193,25 @@ def validate_graph_schema(data, *, require_decoder_metadata=False):
     count = data.x.size(0)
     if data.edge_index is None or data.edge_index.shape[0] != 2:
         raise ValueError("graph.edge_index must be [2,E]")
-    if data.edge_attr is None or data.edge_attr.ndim != 2 or data.edge_attr.size(1) != 2:
-        raise ValueError("graph.edge_attr must be [E,2]")
+    if data.edge_attr is None or data.edge_attr.ndim not in (1, 2):
+        raise ValueError("graph.edge_attr must be [E] or [E,D]")
+    actual_edge_dim = 1 if data.edge_attr.ndim == 1 else data.edge_attr.size(1)
     if data.edge_attr.size(0) != data.edge_index.size(1):
         raise ValueError("graph.edge_attr and graph.edge_index contain different edge counts")
+    if actual_edge_dim not in EDGE_MODE_DIMS.values():
+        raise ValueError(f"Unsupported graph edge dimension: {actual_edge_dim}")
+    if expected_edge_dim is not None and actual_edge_dim != int(expected_edge_dim):
+        raise ValueError(
+            f"graph.edge_attr has dimension {actual_edge_dim}, expected {expected_edge_dim}"
+        )
+    declared_edge_mode = getattr(data, "edge_mode", None)
+    if declared_edge_mode in EDGE_MODE_DIMS:
+        declared_edge_dim = EDGE_MODE_DIMS[declared_edge_mode]
+        if actual_edge_dim != declared_edge_dim:
+            raise ValueError(
+                f"graph.edge_mode={declared_edge_mode!r} requires edge dimension "
+                f"{declared_edge_dim}, got {actual_edge_dim}"
+            )
     if data.pos is None or data.pos.shape != (count, 2):
         raise ValueError("graph.pos must be [N,2]")
     if require_decoder_metadata:
@@ -213,6 +246,7 @@ def build_pyg_graph(
     dense_tokens=None,
     levels=None,
     slide_id=None,
+    edge_mode="dual",
 ):
     edges, edge_attr = build_graph(
         coords,
@@ -220,6 +254,7 @@ def build_pyg_graph(
         k=k,
         max_distance=max_distance,
         distance_multiplier=distance_multiplier,
+        edge_mode=edge_mode,
     )
     return validate_graph_schema(
         to_pyg_data(
@@ -232,5 +267,7 @@ def build_pyg_graph(
             dense_tokens=dense_tokens,
             levels=levels,
             slide_id=slide_id,
+            edge_mode=edge_mode,
         ),
+        expected_edge_dim=EDGE_MODE_DIMS[edge_mode],
     )

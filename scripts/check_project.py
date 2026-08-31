@@ -20,6 +20,7 @@ ACTIVE_FILES = (
     "dinov2_stage2_2_FmH2ST/dinov2/data/datasets/graph_builder.py",
     "dinov2_stage2_2_FmH2ST/dinov2/data/datasets/image_folder.py",
     "dinov2_stage2_2_FmH2ST/dinov2/train/gcn_meta_arch.py",
+    "dinov2_stage2_2_FmH2ST/experiments/stage2_variants/summarize_runs.py",
     "dinov2_segmentation/data/feature_store.py",
     "dinov2_segmentation/data/manifest_dataset.py",
     "dinov2_segmentation/build_manifest.py",
@@ -31,6 +32,9 @@ ACTIVE_SCRIPTS = (
     "dinov2_stage1_Extract2s2/pretrain_imgnet22k.sh",
     "dinov2_stage1_Extract2s2/pretrain_stage1a.sh",
     "dinov2_stage2_2_FmH2ST/pretrain.sh",
+    "dinov2_stage2_2_FmH2ST/experiments/stage2_variants/prepare_graphs.sh",
+    "dinov2_stage2_2_FmH2ST/experiments/stage2_variants/run_variant.sh",
+    "dinov2_stage2_2_FmH2ST/experiments/stage2_variants/run_parallel.sh",
 )
 LEGACY_PROJECTS = (
     "dinov2_finetune",
@@ -97,11 +101,13 @@ def main() -> int:
     print(f"- isolated {len(LEGACY_PROJECTS)} legacy projects under legacy/")
     if embeddings.is_dir():
         print(f"- paired graph arrays: {len(features)} slides")
-    current_graphs = ROOT / "Graph/graphs-current"
-    if current_graphs.is_dir():
-        print(f"- current two-channel graphs: {len(list(current_graphs.glob('*.pt')))}")
+    variant_graph_root = ROOT / "Graph/stage2_variants"
+    if variant_graph_root.is_dir():
+        dual_count = len(list((variant_graph_root / "dual").glob("*.pt")))
+        spatial_count = len(list((variant_graph_root / "spatial").glob("*.pt")))
+        print(f"- Stage-2 variant graphs: dual={dual_count}, spatial={spatial_count}")
     else:
-        print("- current two-channel graphs: not generated yet (legacy graphs were preserved)")
+        print("- Stage-2 variant graph directories: not prepared")
     return 0
 
 
