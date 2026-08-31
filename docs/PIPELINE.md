@@ -36,7 +36,14 @@ Stage-1A 权重。
 
 多 GPU 导出会自动在文件名加入 rank，避免不同进程覆盖同一个 chunk。
 
-随后运行 `organize_features.py`，用 patch CSV 将 shard 还原成每张 WSI 的
+完整训练集原始 CSV 不在当前迁移后的工作区，但身份和坐标没有丢失：
+`Data/Pretrain_extra/entries.npy` 保留全部 2,299,631 个 patch 文件名，
+`Graph/embeddings-1024` 保留 2188 个 slide split 的坐标和节点顺序。先运行
+`scripts/reconstruct_patch_metadata.py`，按已验证的 `patch_idx` 与 `(y,x)` 同序契约
+重建完整 manifest。参考目录的旧特征只用于核对节点数量，绝不会写入重建结果；
+Stage 2 的节点特征仍全部来自获选 Stage-1 checkpoint。
+
+随后运行 `organize_features.py`，用这个完整 patch manifest 将 shard 还原成每张 WSI 的
 `*_features.npy`、`*_coords.npy`、`*_metadata.pt` 和独立的
 `*_dense_tokens.npy`（memory-map 友好）。用于分割时加
 `--require-dense-tokens`，从这一刻起节点特征、dense token、坐标和 patch ID 共享

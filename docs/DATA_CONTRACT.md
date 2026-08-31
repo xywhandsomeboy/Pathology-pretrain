@@ -16,6 +16,12 @@
 数组、图节点和 context 的第 `i` 项必须始终代表同一个五元组。只依赖数组下标而不保存
 身份信息的旧文件只能用于旧 Stage 2 预训练，不能直接进入新分割 decoder。
 
+当前完整训练 manifest 由 `scripts/reconstruct_patch_metadata.py` 从两份不可变身份来源
+重建：ImageNet22k `entries.npy` 中的文件名，以及参考 per-slide `*_coords.npy` 中的
+坐标/节点顺序。工具要求每个 slide 的数字 patch 索引顺序与 `(y,x)` 光栅顺序一致，
+检查所有 slide、split、节点数量和坐标唯一性，并用现存独立 CSV 验证该顺序契约。
+参考 `*_features.npy` 仅用于数量核验，不能作为新 Stage-1 特征复用。
+
 ## Stage 1 decoder shard
 
 `decoder_features_s1_part*.pt` 是字典：

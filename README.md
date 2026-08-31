@@ -54,13 +54,22 @@ bash pretrain_stage1a_cosine200_e800.sh
 STAGE1_WEIGHTS=/absolute/path/to/merged_stage1_checkpoint.pth \
   bash pretrain_imgnet22k.sh
 
-# 按 patch CSV 把 Stage-1 shard 整理为每张 WSI 一组文件
+# 从完整 ImageNet22k 身份索引和只读参考坐标重建 2,299,631 个训练 patch 的元数据。
+# 参考目录只提供坐标/节点顺序；其中的旧特征不会复制进新结果。
+cd ..
+dinov2/.venv/bin/python scripts/reconstruct_patch_metadata.py \
+  --entries-npy Data/Pretrain_extra/entries.npy \
+  --reference-embeddings-dir Graph/embeddings-1024 \
+  --validation-csv Data/meta/patch/patch_grid_positions-TCGA-disease2-test-lesstest.csv \
+  --output-csv Data/meta/patch/patch_grid_positions-reconstructed-train.csv
+
+# 按完整 patch manifest 把获选 Stage-1 shard 整理为每张 WSI 一组文件
+cd dinov2_stage1_Extract2s2
 ../dinov2/.venv/bin/python organize_features.py \
   --embeddings-dir dinov2/results/stage1b_features/embeddings \
-  --patch-csv ../Data/meta/patch/patch_grid_positions-TCGA-disease2-test-lesstest.csv \
+  --patch-csv ../Data/meta/patch/patch_grid_positions-reconstructed-train.csv \
   --output-dir ../Graph/embeddings-current \
-  --require-dense-tokens \
-  --skip-unmatched
+  --require-dense-tokens
 
 # Stage 2：从已有成对 npy 建图
 cd ../dinov2_stage2_2_FmH2ST
