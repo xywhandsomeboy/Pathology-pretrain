@@ -22,6 +22,13 @@ WSI 切图程序本身不在当前仓库中。仓库中保留的是已切 patch�
 入口：`pretrain.sh`，实际转到 `pretrain_stage1a.sh`。必须通过 `DINO_WEIGHTS` 指定
 DINO 初始化权重。
 
+长周期实验会另外保留 `budget_checkpoints/model_0009999.rank_0.pth`，用于和旧版在
+完全相同的 10,000-step 预算下做诊断；200-epoch 周期端点保存在
+`cycle_checkpoints/`。最终选择仍由 `scripts/compare_stage1_checkpoints.py` 在所有完整
+候选的相同 trailing window 上统一完成。工具若发现日志由 no-resume 重启追加而成，
+只选择与最终 checkpoint 对应的最后一个严格单调片段，并在 JSON 中记录被丢弃的前缀
+数量，禁止把两次运行的指标混合统计。
+
 ## 2. Stage-1B：确定性导出
 
 入口：`pretrain_imgnet22k.sh`。必须通过 `STAGE1_WEIGHTS` 指定训练完成且已合并的

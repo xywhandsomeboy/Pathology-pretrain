@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Compare completed Stage-1A runs at their preserved checkpoint endpoints.
 
-The comparison deliberately uses only completed runs.  For each ``model_final``
-and archived cosine-cycle endpoint, it summarizes the same trailing iteration
-window from ``training_metrics.json`` and ranks candidates by mean total loss.
-This avoids selecting a checkpoint from one unusually easy training batch.
+The comparison deliberately uses only completed runs.  For each ``model_final``,
+archived same-budget endpoint, and cosine-cycle endpoint, it summarizes the same
+trailing iteration window from ``training_metrics.json`` and ranks candidates
+by mean total loss.  This avoids selecting a checkpoint from one unusually easy
+training batch while retaining a strict equal-step comparison.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ METRICS = (
 ITERATION_PATTERN = re.compile(r"model_(\d+)\.rank_0\.pth$")
 
 
-def _load_metrics(path: Path) -> list[dict[str, float]]:
+def _load_metrics(path: Path) -> tuple[list[dict[str, float]], dict[str, int]]:
     records = []
     with path.open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
@@ -46,10 +47,26 @@ def _load_metrics(path: Path) -> list[dict[str, float]]:
             records.append(record)
     if not records:
         raise ValueError(f"No metric records in {path}")
-    iterations = [int(record["iteration"]) for record in records]
+    # A no-resume relaunch may append a fresh iteration-0 segment to an
+    # existing metrics file. Only the final monotonic segment can correspond
+    # to model_final; mixing the abandoned prefix would bias the comparison.
+    restart_indices = [
+        index
+        for index in range(1, len(records))
+        if int(records[index]["iteration"]) <= int(records[index - 1]["iteration"])
+    ]
+    segment_start = restart_indices[-1] if restart_indices else 0
+    selected = records[segment_start:]
+    iterations = [int(record["iteration"]) for record in selected]
     if iterations != sorted(iterations) or len(iterations) != len(set(iterations)):
-        raise ValueError(f"Metric iterations must be strictly increasing in {path}")
-    return records
+        raise ValueError(f"Final metric segment is not strictly increasing in {path}")
+    provenance = {
+        "raw_records": len(records),
+        "selected_records": len(selected),
+        "discarded_prefix_records": segment_start,
+        "restart_boundaries": len(restart_indices),
+    }
+    return selected, provenance
 
 
 def _checkpoint_iteration(path: Path, final_iteration: int) -> int:
@@ -68,9 +85,10 @@ def _candidate_checkpoints(run_dir: Path, final_iteration: int) -> list[Path]:
             f"Stage-1 run is not complete (missing {final_checkpoint})"
         )
     candidates = [final_checkpoint]
-    cycle_dir = run_dir / "cycle_checkpoints"
-    if cycle_dir.is_dir():
-        candidates.extend(sorted(cycle_dir.glob("model_*.rank_0.pth")))
+    for archive_name in ("budget_checkpoints", "cycle_checkpoints"):
+        archive_dir = run_dir / archive_name
+        if archive_dir.is_dir():
+            candidates.extend(sorted(archive_dir.glob("model_*.rank_0.pth")))
 
     # model_final and the last cycle endpoint may be hard links to one inode.
     unique = []
@@ -137,17 +155,17 @@ def compare(run_dirs: list[Path], window_iterations: int) -> dict:
         metrics_path = run_dir / "training_metrics.json"
         if not metrics_path.is_file():
             raise FileNotFoundError(f"Missing Stage-1 metrics: {metrics_path}")
-        records = _load_metrics(metrics_path)
+        records, metrics_log = _load_metrics(metrics_path)
         final_iteration = int(records[-1]["iteration"])
         for checkpoint in _candidate_checkpoints(run_dir, final_iteration):
-            candidates.append(
-                _summarize_candidate(
-                    run_dir,
-                    checkpoint,
-                    records,
-                    window_iterations,
-                )
+            candidate = _summarize_candidate(
+                run_dir,
+                checkpoint,
+                records,
+                window_iterations,
             )
+            candidate["metrics_log"] = metrics_log
+            candidates.append(candidate)
     if len(candidates) < 2:
         raise ValueError("At least two completed Stage-1 candidates are required")
     candidates.sort(
@@ -188,6 +206,12 @@ def main() -> int:
             f"total_loss={total['mean']:.8f}±{total['std']:.8f}, "
             f"records={candidate['window_records']}"
         )
+        discarded = candidate["metrics_log"]["discarded_prefix_records"]
+        if discarded:
+            print(
+                f"   selected final monotonic log segment; "
+                f"discarded {discarded} prefix records"
+            )
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         temporary = args.output_json.with_suffix(args.output_json.suffix + ".tmp")
