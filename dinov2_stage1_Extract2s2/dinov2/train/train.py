@@ -10,12 +10,14 @@ import os
 from functools import partial
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig, FullStateDictConfig
 import torch
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
-from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
+from dinov2.data import (
+    collate_data_and_cast,
+    DataAugmentationDINO,
+    DataAugmentationStage1Extraction,
+)
 import dinov2.distributed as distributed
 from dinov2.fsdp import FSDPCheckpointer
 from dinov2.logging import MetricLogger
@@ -23,7 +25,6 @@ from dinov2.utils.config import setup
 from dinov2.utils.utils import CosineScheduler
 
 from dinov2.train.gcn_meta_arch import GCNMetaArch
-import os
 import numpy as np
 
 torch.backends.cuda.matmul.allow_tf32 = True  # PyTorch 1.12 sets this to False by default
@@ -79,15 +80,8 @@ def build_schedulers(cfg):
         final_value=cfg.optim["weight_decay_end"],
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
     )
-    momentum = dict(
-        base_value=cfg.student["momentum"],
-        final_value=cfg.student["final_momentum"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
-    )
-
     lr_schedule = CosineScheduler(**lr)
     wd_schedule = CosineScheduler(**wd)
-    momentum_schedule = CosineScheduler(**momentum)
     last_layer_lr_schedule = CosineScheduler(**lr)
 
     last_layer_lr_schedule.schedule[
@@ -99,7 +93,6 @@ def build_schedulers(cfg):
     return (
         lr_schedule,
         wd_schedule,
-        momentum_schedule,
         last_layer_lr_schedule,
     )
 
@@ -114,26 +107,65 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
 
 
 @torch.no_grad()
-def do_test(cfg, model):
-    model.eval()
-    inputs_dtype = torch.float
-    # setup data preprocessing
+def _save_feature_chunk(output_dir, chunk_index, chunk, export_dense_tokens):
+    rank = distributed.get_global_rank()
+    rank_suffix = "" if distributed.get_global_size() == 1 else f"_rank{rank:03d}"
+    stem = f"part{chunk_index:05d}{rank_suffix}"
+    filenames = list(chunk["filenames"])
+    node_features = torch.cat(chunk["node_features"], dim=0).contiguous()
+    np.savez_compressed(
+        os.path.join(output_dir, f"filenames_pretrained_s1_{stem}.npz"),
+        np.asarray(filenames),
+    )
+    np.savez_compressed(
+        os.path.join(output_dir, f"features_pretrained_s1_{stem}.npz"),
+        node_features.numpy(),
+    )
+    if export_dense_tokens:
+        payload = {
+            "format_version": 1,
+            "filenames": filenames,
+            "patch_ids": list(chunk["patch_ids"]),
+            "node_features": node_features,
+            "dense_tokens": torch.cat(chunk["dense_tokens"], dim=0).contiguous(),
+        }
+        for key in ("coords", "levels"):
+            if chunk[key]:
+                payload[key] = torch.cat(chunk[key], dim=0).contiguous()
+        if chunk["slide_ids"]:
+            payload["slide_ids"] = list(chunk["slide_ids"])
+        torch.save(
+            payload,
+            os.path.join(output_dir, f"decoder_features_s1_{stem}.pt"),
+        )
+    logger.info("Saved Stage-1 feature chunk %s with %d patches", stem, len(filenames))
 
-    img_size = cfg.crops.global_crops_size
-    patch_size = cfg.student.patch_size
-    n_tokens = (img_size // patch_size) ** 2
-    
-    data_transform = DataAugmentationDINO(
-        cfg.crops.global_crops_scale,
-        cfg.crops.local_crops_scale,
-        cfg.crops.local_crops_number,
-        global_crops_size=cfg.crops.global_crops_size,
-        local_crops_size=cfg.crops.local_crops_size,
+
+def _empty_feature_chunk():
+    return {
+        "filenames": [],
+        "patch_ids": [],
+        "slide_ids": [],
+        "coords": [],
+        "levels": [],
+        "node_features": [],
+        "dense_tokens": [],
+    }
+
+
+@torch.no_grad()
+def do_test(cfg, model):
+    """Stage-1B deterministic extraction with rank-safe, aligned shards."""
+    model.eval()
+    data_transform = DataAugmentationStage1Extraction(
+        image_size=cfg.crops.global_crops_size,
+        local_size=cfg.crops.local_crops_size,
+        num_local_crops=cfg.crops.local_crops_number,
     )
 
     collate_fn = partial(
         collate_data_and_cast,
-        dtype=inputs_dtype,
+        dtype=torch.float,
     )
 
     # setup data loader
@@ -142,55 +174,53 @@ def do_test(cfg, model):
         transform=data_transform,
         target_transform=lambda _: (),
     )
-    # sampler_type = SamplerType.INFINITE
-    sampler_type = SamplerType.EPOCH
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=cfg.train.batch_size_per_gpu,
         num_workers=cfg.train.num_workers,
         shuffle=False,
         seed=42,  # TODO: Fix this -- cfg.train.seed
-        sampler_type=sampler_type,
-        sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+        sampler_type=SamplerType.EPOCH,
+        sampler_advance=0,
         drop_last=False,
         collate_fn=collate_fn,
     )
-    output_dir = os.path.join(cfg.train.output_dir,"embeddings")
-    os.makedirs(output_dir,exist_ok=True)
-    all_filenames = []
-    all_outputs = []
-    save_interval = 10  # 每多少个样本保存一次
+    output_dir = os.path.join(cfg.train.output_dir, "embeddings")
+    os.makedirs(output_dir, exist_ok=True)
+    export_dense_tokens = bool(getattr(cfg.feature, "export_dense_tokens", False))
+    chunk = _empty_feature_chunk()
+    save_interval = 10
     chunk_idx = 0
-    print("dataset size", len(data_loader.dataset))
-    num_batches = len(data_loader.dataset) // data_loader.batch_size//10
-    print("num batches per epoch:", num_batches)
+    logger.info("Extracting %d patches in %d batches", len(data_loader.dataset), len(data_loader))
     for idx, data in enumerate(data_loader):
-        filename = data["filenames"]
-        outputs = model.forward_backward(data)
-        print(outputs.shape)
-        if isinstance(outputs, torch.Tensor):
-            outputs = outputs.detach().cpu().numpy().tolist()
-        all_filenames.extend(filename)
-        all_outputs+=outputs
-        # 每 save_interval 保存一次
+        if export_dense_tokens:
+            decoder_features = model.extract_decoder_features(data)
+            outputs = decoder_features["node_features"]
+            chunk["dense_tokens"].append(
+                decoder_features["dense_tokens"].detach().cpu().to(torch.float16)
+            )
+        else:
+            outputs = model.forward_backward(data)
+        outputs = outputs.detach().cpu().float()
+        filenames = list(map(str, data["filenames"]))
+        if len(outputs) != len(filenames):
+            raise ValueError("Stage-1 outputs and filenames have different lengths")
+        chunk["filenames"].extend(filenames)
+        chunk["patch_ids"].extend(
+            list(map(str, data.get("patch_ids", [os.path.splitext(os.path.basename(v))[0] for v in filenames])))
+        )
+        chunk["slide_ids"].extend(list(map(str, data.get("slide_ids", []))))
+        for key in ("coords", "levels"):
+            if key in data:
+                chunk[key].append(torch.as_tensor(data[key]).cpu())
+        chunk["node_features"].append(outputs)
+
         if (idx + 1) % save_interval == 0:
-
-            np.savez_compressed(os.path.join(output_dir, f"filenames_pretrained_s1_part{chunk_idx}.npz"),
-                    np.array(all_filenames))
-            np.savez_compressed(os.path.join(output_dir, f"features_pretrained_s1_part{chunk_idx}.npz"),
-                    np.array(all_outputs))
-
-            print(f"Saved chunk {chunk_idx}, size={len(all_filenames)}")
-
-            # 清空缓存，进入下一批
+            _save_feature_chunk(output_dir, chunk_idx, chunk, export_dense_tokens)
             chunk_idx += 1
-            all_filenames, all_outputs = [], []
-    if all_outputs:
-        np.savez_compressed(os.path.join(output_dir, f"filenames_pretrained_s1_part{chunk_idx}.npz"),
-                np.array(all_filenames))
-        np.savez_compressed(os.path.join(output_dir, f"features_pretrained_s1_part{chunk_idx}.npz"),
-                np.array(all_outputs))
-        print(f"Saved final chunk {chunk_idx}, size={len(all_filenames)}")
+            chunk = _empty_feature_chunk()
+    if chunk["node_features"]:
+        _save_feature_chunk(output_dir, chunk_idx, chunk, export_dense_tokens)
         
 
 def do_train(cfg, model, resume=False):
@@ -204,14 +234,15 @@ def do_train(cfg, model, resume=False):
     (
         lr_schedule,
         wd_schedule,
-        momentum_schedule,
         last_layer_lr_schedule,
     ) = build_schedulers(cfg)
     
     # checkpointer
     checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
 
-    start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
+    # MODEL.WEIGHTS initializes the frozen DINO before FSDP wrapping. Resume
+    # only from checkpoints produced in this Stage-1 output directory.
+    start_iter = checkpointer.resume_or_load("", resume=resume).get("iteration", -1) + 1
 
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
@@ -223,12 +254,6 @@ def do_train(cfg, model, resume=False):
         max_to_keep=3,
     )
 
-    # setup data preprocessing
-
-    img_size = cfg.crops.global_crops_size
-    patch_size = cfg.student.patch_size
-    n_tokens = (img_size // patch_size) ** 2
-    
     data_transform = DataAugmentationDINO(
         cfg.crops.global_crops_scale,
         cfg.crops.local_crops_scale,
@@ -249,16 +274,15 @@ def do_train(cfg, model, resume=False):
         transform=data_transform,
         target_transform=lambda _: (),
     )
-    # sampler_type = SamplerType.INFINITE
-    sampler_type = SamplerType.RANDOM
+    sampler_type = SamplerType.SHARDED_INFINITE
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=cfg.train.batch_size_per_gpu,
         num_workers=cfg.train.num_workers,
         shuffle=True,
-        seed=start_iter,  # TODO: Fix this -- cfg.train.seed
+        seed=cfg.train.seed + start_iter,
         sampler_type=sampler_type,
-        sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+        sampler_advance=0,
         drop_last=True,
         collate_fn=collate_fn,
     )
@@ -279,17 +303,56 @@ def do_train(cfg, model, resume=False):
         max_iter,
         start_iter,
     ):
-        current_batch_size = data["collated_global_crops"].shape[0] / 2
-        if iteration > max_iter:
+        if iteration >= max_iter:
             return
 
-        features = model.forward_backward(data)
+        lr = lr_schedule[iteration]
+        wd = wd_schedule[iteration]
+        last_layer_lr = last_layer_lr_schedule[iteration]
+        apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss_dict = model.forward_pretrain(data)
+
+        if fp16_scaler is not None:
+            if cfg.optim.clip_grad:
+                fp16_scaler.unscale_(optimizer)
+                for module in model.student.values():
+                    module.clip_grad_norm_(cfg.optim.clip_grad)
+            fp16_scaler.step(optimizer)
+            fp16_scaler.update()
+        else:
+            if cfg.optim.clip_grad:
+                for module in model.student.values():
+                    module.clip_grad_norm_(cfg.optim.clip_grad)
+            optimizer.step()
+
+        if distributed.get_global_size() > 1:
+            for value in loss_dict.values():
+                torch.distributed.all_reduce(value)
+        reduced = {
+            key: value.item() / distributed.get_global_size()
+            for key, value in loss_dict.items()
+        }
+        if not math.isfinite(reduced["total_loss"]):
+            raise FloatingPointError(f"Non-finite Stage-1 loss: {reduced}")
+        metric_logger.update(lr=lr, wd=wd, **reduced)
+        periodic_checkpointer.step(iteration)
+        iteration += 1
+
+    metric_logger.synchronize_between_processes()
+    return {key: meter.global_avg for key, meter in metric_logger.meters.items()}
 
 
 
 def main(args):
     cfg = setup(args)
-    
+
+    if not cfg.MODEL.WEIGHTS:
+        raise ValueError(
+            "MODEL.WEIGHTS is required. Pass it on the command line or set "
+            "DINO_WEIGHTS/STAGE1_WEIGHTS in the maintained launch scripts."
+        )
     model = GCNMetaArch(cfg).to(torch.device("cuda"))
     checkpoint = torch.load(cfg.MODEL.WEIGHTS, map_location="cpu")
     checkpoint = checkpoint.get(
@@ -299,20 +362,36 @@ def main(args):
         checkpoint = {key.removeprefix("student."): value for key, value in checkpoint.items()}
     # print(checkpoint.keys())
     incompatible = model.student.load_state_dict(checkpoint, strict=False)
+    backbone_missing = [
+        key for key in incompatible.missing_keys if key.startswith("backbone.")
+    ]
+    if backbone_missing:
+        raise RuntimeError(
+            f"DINO checkpoint is incompatible: {len(backbone_missing)} "
+            "backbone tensors are missing."
+        )
     spatial_missing = [
         key for key in incompatible.missing_keys
-        if key.startswith("spatial_agg.") or key.startswith("node_fusion.")
+        if key.startswith((
+            "spatial_agg.",
+            "local_spatial_agg.",
+            "local_crop_fusion.",
+            "node_fusion.",
+        ))
     ]
     if spatial_missing:
         message = (
             f"Checkpoint has no trained spatial feature branch "
             f"({len(spatial_missing)} missing tensors). Train it in "
-            "dinov2_finetune or load a compatible checkpoint before producing "
+            "Stage-1A or load a compatible checkpoint before producing "
             "final Stage-1 features."
         )
-        if cfg.feature.require_trained_spatial:
+        if args.eval_only and cfg.feature.require_trained_spatial:
             raise RuntimeError(message)
-        logger.warning("%s Continuing only because feature.require_trained_spatial=false.", message)
+        if args.eval_only:
+            logger.warning("%s Continuing only because feature.require_trained_spatial=false.", message)
+        else:
+            logger.info("%s This is expected for a new Stage-1A run.", message)
 
     # model.prepare_for_distributed_training()
     
@@ -337,6 +416,7 @@ def main(args):
         print("Evaluation...")
         return do_test(cfg, model)
 
+    model.prepare_for_distributed_training()
     do_train(cfg, model, resume=not args.no_resume)
 
 

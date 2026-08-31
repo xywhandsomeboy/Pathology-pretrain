@@ -116,3 +116,44 @@ class DataAugmentationDINO(object):
         output["offsets"] = ()
 
         return output
+
+
+class DataAugmentationStage1Extraction:
+    """Deterministic full-patch transform for reproducible Stage-1B features."""
+
+    def __init__(self, image_size=224, local_size=96, num_local_crops=4):
+        if num_local_crops < 1 or num_local_crops > 5:
+            raise ValueError("Deterministic extraction supports 1 to 5 local crops")
+        self.image_size = image_size
+        self.local_size = local_size
+        self.num_local_crops = num_local_crops
+        self.resize = transforms.Resize(
+            (image_size, image_size),
+            interpolation=transforms.InterpolationMode.BICUBIC,
+        )
+        self.to_normalized_tensor = transforms.Compose([
+            transforms.ToTensor(), make_normalize_transform()
+        ])
+
+    def __call__(self, image):
+        resized = self.resize(image)
+        tensor = self.to_normalized_tensor(resized)
+        width, height = resized.size
+        size = min(self.local_size, width, height)
+        positions = [
+            (0, 0),
+            (width - size, 0),
+            (0, height - size),
+            (width - size, height - size),
+            ((width - size) // 2, (height - size) // 2),
+        ]
+        local_crops = [
+            self.to_normalized_tensor(resized.crop((x, y, x + size, y + size)))
+            for x, y in positions[: self.num_local_crops]
+        ]
+        return {
+            "global_crops": [tensor, tensor.clone()],
+            "global_crops_teacher": [tensor, tensor.clone()],
+            "local_crops": local_crops,
+            "offsets": (),
+        }

@@ -10,12 +10,10 @@ import os
 from functools import partial
 
 from fvcore.common.checkpoint import PeriodicCheckpointer
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig, FullStateDictConfig
 import torch
 
 from dinov2.data import SamplerType, make_data_loader, make_dataset
-from dinov2.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
+from dinov2.data import collate_data_and_cast
 import dinov2.distributed as distributed
 from dinov2.fsdp import FSDPCheckpointer
 from dinov2.logging import MetricLogger
@@ -77,15 +75,8 @@ def build_schedulers(cfg):
         final_value=cfg.optim["weight_decay_end"],
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
     )
-    momentum = dict(
-        base_value=cfg.student["momentum"],
-        final_value=cfg.student["final_momentum"],
-        total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
-    )
-
     lr_schedule = CosineScheduler(**lr)
     wd_schedule = CosineScheduler(**wd)
-    momentum_schedule = CosineScheduler(**momentum)
     last_layer_lr_schedule = CosineScheduler(**lr)
 
     last_layer_lr_schedule.schedule[
@@ -97,7 +88,6 @@ def build_schedulers(cfg):
     return (
         lr_schedule,
         wd_schedule,
-        momentum_schedule,
         last_layer_lr_schedule,
     )
 
@@ -133,7 +123,6 @@ def do_train(cfg, model, resume=False):
     (
         lr_schedule,
         wd_schedule,
-        momentum_schedule,
         last_layer_lr_schedule,
     ) = build_schedulers(cfg)
     
@@ -165,18 +154,16 @@ def do_train(cfg, model, resume=False):
         dataset_str=cfg.train.dataset_path,
         transform=None,
         target_transform=lambda _: (),
-        mask_strategy=cfg.gcn.mask_strategy,
     )
-    # sampler_type = SamplerType.INFINITE
     sampler_type = SamplerType.SHARDED_INFINITE
     data_loader = make_data_loader(
         dataset=dataset,
         batch_size=cfg.train.batch_size_per_gpu,
         num_workers=cfg.train.num_workers,
         shuffle=True,
-        seed=start_iter,  # TODO: Fix this -- cfg.train.seed
+        seed=cfg.train.seed + start_iter,
         sampler_type=sampler_type,
-        sampler_advance=0,  # TODO(qas): fix this -- start_iter * cfg.train.batch_size_per_gpu,
+        sampler_advance=0,
         drop_last=True,
         collate_fn=collate_fn,
     )
@@ -197,15 +184,13 @@ def do_train(cfg, model, resume=False):
         max_iter,
         start_iter,
     ):
-#         current_batch_size = data["collated_global_crops"].shape[0] / 2
-        if iteration > max_iter:
+        if iteration >= max_iter:
             return
 
         # apply schedules
 
         lr = lr_schedule[iteration]
         wd = wd_schedule[iteration]
-        mom = momentum_schedule[iteration]
         last_layer_lr = last_layer_lr_schedule[iteration]
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
@@ -236,18 +221,13 @@ def do_train(cfg, model, resume=False):
                 torch.distributed.all_reduce(v)
         loss_dict_reduced = {k: v.item() / distributed.get_global_size() for k, v in loss_dict.items()}
 
-        if math.isnan(sum(loss_dict_reduced.values())):
-            logger.info("NaN detected")
-            raise AssertionError
-        # losses_reduced = sum(loss for loss in loss_dict_reduced.values())
+        if not math.isfinite(sum(loss_dict_reduced.values())):
+            raise FloatingPointError(f"Non-finite Stage-2 loss: {loss_dict_reduced}")
 
         metric_logger.update(lr=lr)
         metric_logger.update(wd=wd)
-        metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(**loss_dict_reduced)
-#         metric_logger.update(current_batch_size=current_batch_size)
-        # metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
 
         # checkpointing and testing
 

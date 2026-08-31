@@ -83,6 +83,16 @@ def rankstr():
 
 
 class FSDPCheckpointer(Checkpointer):
+    def _state_dict_type(self) -> StateDictType:
+        """Use full state dicts when single-rank FSDP falls back to NO_SHARD."""
+        fsdp_modules = FSDP.fsdp_modules(self.model)
+        if not fsdp_modules or all(
+            module.sharding_strategy is ShardingStrategy.NO_SHARD
+            for module in fsdp_modules
+        ):
+            return StateDictType.FULL_STATE_DICT
+        return StateDictType.LOCAL_STATE_DICT
+
     def save(self, name: str, **kwargs: Any) -> None:
         """
         Dump model and checkpointables to a file.
@@ -95,7 +105,9 @@ class FSDPCheckpointer(Checkpointer):
             return
 
         data = {}
-        with FSDP.state_dict_type(self.model, StateDictType.LOCAL_STATE_DICT):
+        state_dict_type = self._state_dict_type()
+        self.logger.info("Collecting %s", state_dict_type.name)
+        with FSDP.state_dict_type(self.model, state_dict_type):
             data["model"] = self.model.state_dict()
 
         # data["model"] = self.model.state_dict()
@@ -112,59 +124,8 @@ class FSDPCheckpointer(Checkpointer):
         self.tag_last_checkpoint(basename)
 
     def load(self, *args, **kwargs):
-        with FSDP.state_dict_type(self.model, StateDictType.LOCAL_STATE_DICT):
+        with FSDP.state_dict_type(self.model, self._state_dict_type()):
             return super().load(*args, **kwargs)
-
-    # def save(self, name: str, **kwargs: Any) -> None:
-    #     if not self.save_dir or not self.save_to_disk:
-    #         return
-
-    #     data = {}
-
-    #     # 自动选择保存策略
-    #     if self.model.sharding_strategy == ShardingStrategy.NO_SHARD:
-    #         # 用 FULL_STATE_DICT，只在 rank0 保存
-    #         state_dict_type = StateDictType.FULL_STATE_DICT
-    #         save_per_rank = False
-    #     else:
-    #         # 用 LOCAL_STATE_DICT，每个 rank 保存自己的一份
-    #         state_dict_type = StateDictType.LOCAL_STATE_DICT
-    #         save_per_rank = True
-
-    #     with FSDP.state_dict_type(self.model, state_dict_type):
-    #         data["model"] = self.model.state_dict()
-
-    #     for key, obj in self.checkpointables.items():
-    #         data[key] = obj.state_dict()
-    #     data.update(kwargs)
-
-    #     # rank 保存逻辑
-    #     rank = distributed.get_global_rank()
-    #     if save_per_rank:
-    #         basename = f"{name}.rank{rank}.pth"
-    #     else:
-    #         if rank != 0:
-    #             torch.distributed.barrier()
-    #             return
-    #         basename = f"{name}.pth"
-
-    #     save_file = os.path.join(self.save_dir, basename)
-    #     self.logger.info(f"[Rank {rank}] Saving checkpoint to {save_file}")
-    #     with self.path_manager.open(save_file, "wb") as f:
-    #         torch.save(data, f)
-    #     self.tag_last_checkpoint(basename)
-
-    #     torch.distributed.barrier()
-
-    # def load(self, *args, **kwargs):
-    #     # 根据保存时的逻辑来 load
-    #     if self.model.sharding_strategy == ShardingStrategy.NO_SHARD:
-    #         state_dict_type = StateDictType.FULL_STATE_DICT
-    #     else:
-    #         state_dict_type = StateDictType.LOCAL_STATE_DICT
-
-    #     with FSDP.state_dict_type(self.model, state_dict_type):
-    #         return super().load(*args, **kwargs)
         
 
     def has_checkpoint(self) -> bool:

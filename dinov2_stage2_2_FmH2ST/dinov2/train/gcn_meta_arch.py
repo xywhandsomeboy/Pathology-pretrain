@@ -1,4 +1,6 @@
 import logging
+from types import SimpleNamespace
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -44,6 +46,36 @@ class GCNMetaArch(nn.Module):
 
     def forward(self, inputs):
         raise NotImplementedError
+
+    @torch.no_grad()
+    def extract_context(self, graph):
+        """Return one contextualized feature per node without masking/noise.
+
+        This is the deterministic branch-1 output consumed by the segmentation
+        decoder. Call it on the complete WSI graph; random training subgraphs
+        would break the one-to-one mapping to raw patches.
+        """
+        device = next(self.student.parameters()).device
+        x = graph.x.to(device)
+        edge_index = graph.edge_index.to(device)
+        edge_attr = graph.edge_attr
+        if edge_attr is None:
+            edge_attr = torch.ones(
+                (edge_index.size(1), self.cfg.gcn.edge_dim),
+                device=device,
+                dtype=x.dtype,
+            )
+        else:
+            edge_attr = edge_attr.to(device)
+        if edge_attr.ndim == 1:
+            edge_attr = edge_attr.unsqueeze(-1)
+        if edge_attr.size(-1) != self.cfg.gcn.edge_dim:
+            raise ValueError(
+                f"Expected {self.cfg.gcn.edge_dim}-D edge_attr, got {edge_attr.size(-1)}"
+            )
+        # Move only graph-computation tensors. Patch identities and any legacy
+        # decoder metadata remain on CPU.
+        return self.student.gcn(x, edge_index, edge_attr)
 
     def backprop_loss(self, loss):
         (self.fp16_scaler.scale(loss) if self.fp16_scaler is not None else loss).backward()
@@ -104,6 +136,62 @@ class GCNMetaArch(nn.Module):
             details[f"node_reconstruction_{name}"] = loss
         return torch.stack(losses).mean(), details
 
+    def _contrast_edge_keep_mask(self, edge_index, num_nodes):
+        """Drop undirected edge pairs without stranding low-degree nodes."""
+        keep = torch.ones(
+            edge_index.size(1), dtype=torch.bool, device=edge_index.device
+        )
+        drop_ratio = float(self.cfg.gcn.view_edge_drop)
+        if edge_index.numel() == 0 or drop_ratio <= 0:
+            return keep
+
+        source, target = edge_index
+        non_loop = source != target
+        if not non_loop.any():
+            return keep
+
+        edge_slots = non_loop.nonzero(as_tuple=False).flatten()
+        left = torch.minimum(source[non_loop], target[non_loop])
+        right = torch.maximum(source[non_loop], target[non_loop])
+        pair_keys = left * num_nodes + right
+        unique_keys, inverse = torch.unique(pair_keys, return_inverse=True)
+        pair_left = torch.div(unique_keys, num_nodes, rounding_mode="floor")
+        pair_right = torch.remainder(unique_keys, num_nodes)
+
+        # Sample once per undirected pair so i->j and j->i are changed together.
+        drop_pair = torch.rand(
+            unique_keys.numel(), device=edge_index.device
+        ) < drop_ratio
+
+        min_neighbors = max(
+            0, int(getattr(self.cfg.gcn, "contrast_min_neighbors", 0))
+        )
+        if min_neighbors and drop_pair.any():
+            degree = torch.zeros(
+                num_nodes, dtype=torch.long, device=edge_index.device
+            )
+            ones = torch.ones_like(pair_left)
+            degree.scatter_add_(0, pair_left, ones)
+            degree.scatter_add_(0, pair_right, ones)
+
+            dropped_degree = torch.zeros_like(degree)
+            dropped_left = pair_left[drop_pair]
+            dropped_right = pair_right[drop_pair]
+            dropped_degree.scatter_add_(0, dropped_left, torch.ones_like(dropped_left))
+            dropped_degree.scatter_add_(0, dropped_right, torch.ones_like(dropped_right))
+            required = degree.clamp(max=min_neighbors)
+            underconnected = degree - dropped_degree < required
+            if underconnected.any():
+                # Restore every sampled pair incident to an under-connected
+                # node. This is conservative and keeps the operation vectorized
+                # for large WSI graphs.
+                drop_pair &= ~(
+                    underconnected[pair_left] | underconnected[pair_right]
+                )
+
+        keep[edge_slots] = ~drop_pair[inverse]
+        return keep
+
     def _noisy_view(self, graph):
         x = graph.x + torch.randn_like(graph.x) * self.cfg.gcn.feature_noise_std
         if self.cfg.gcn.contrast_feature_mask_ratio > 0:
@@ -111,9 +199,7 @@ class GCNMetaArch(nn.Module):
         edge_attr = graph.edge_attr.clone()
         if edge_attr.numel() and self.cfg.gcn.edge_weight_noise_std > 0:
             edge_attr *= 1 + torch.randn_like(edge_attr) * self.cfg.gcn.edge_weight_noise_std
-        keep = torch.rand(graph.edge_index.size(1), device=x.device) >= self.cfg.gcn.view_edge_drop
-        if keep.numel() and not keep.any():
-            keep[torch.randint(keep.numel(), (1,), device=x.device)] = True
+        keep = self._contrast_edge_keep_mask(graph.edge_index, graph.x.size(0))
         return self.student.gcn(x, graph.edge_index[:, keep], edge_attr[keep])
 
     def _reliable_negatives(self, graph, visual_h, context_h, pairs):
@@ -174,7 +260,24 @@ class GCNMetaArch(nn.Module):
         return existence, F.mse_loss(predicted.float(), torch.stack(targets).float())
 
     def forward_backward(self, images):
-        graph = images["original_graph"].to(next(self.student.parameters()).device)
+        source_graph = images["original_graph"]
+        device = next(self.student.parameters()).device
+        # Do not call PyG Data.to(device): decoder metadata (especially
+        # dense_tokens) is not part of graph pretraining and can exhaust VRAM.
+        graph = SimpleNamespace(
+            x=source_graph.x.to(device),
+            edge_index=source_graph.edge_index.to(device),
+            edge_attr=(
+                source_graph.edge_attr.to(device)
+                if source_graph.edge_attr is not None
+                else None
+            ),
+            pos=(
+                source_graph.pos.to(device)
+                if getattr(source_graph, "pos", None) is not None
+                else None
+            ),
+        )
         if graph.edge_attr is None:
             graph.edge_attr = torch.ones((graph.edge_index.size(1), self.cfg.gcn.edge_dim), device=graph.x.device)
         if graph.edge_attr.ndim == 1:

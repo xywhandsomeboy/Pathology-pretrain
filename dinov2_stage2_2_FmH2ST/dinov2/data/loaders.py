@@ -12,7 +12,6 @@ from torch.utils.data import Sampler
 
 from .datasets import ImageNet, ImageNet22k, ImageFolder
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
-# from torchvision.datasets import ImageFolder
 
 logger = logging.getLogger("gnn")
 
@@ -49,7 +48,15 @@ def _parse_dataset_str(dataset_str: str):
 
     for token in tokens[1:]:
         key, value = token.split("=")
-        assert key in ("root", "extra", "split")
+        assert key in (
+            "root",
+            "extra",
+            "split",
+            "min_nodes",
+            "min_edges",
+            "max_nodes",
+            "edge_dim",
+        )
         kwargs[key] = value
 
     if name == "ImageNet":
@@ -73,12 +80,6 @@ def make_dataset(
     dataset_str: str,
     transform: Optional[Callable] = None,
     target_transform: Optional[Callable] = None,
-    mask_ratio: float = 0.75,  # 遮掩比例
-    mask_strategy: str = "edge",  # 遮掩策略
-    rand_walk: bool = False,
-    min_nodes: Optional[int] = None,
-    min_edges: Optional[int] = None,
-    
 ):
     """
     Creates a dataset with the specified parameters.
@@ -94,11 +95,6 @@ def make_dataset(
     logger.info(f'using dataset: "{dataset_str}"')
 
     class_, kwargs = _parse_dataset_str(dataset_str)
-    kwargs["mask_ratio"] = mask_ratio
-    kwargs["mask_strategy"] = mask_strategy
-    kwargs["rand_walk"] = rand_walk
-    kwargs["min_nodes"] = min_nodes
-    kwargs["min_edges"] = min_edges
     dataset = class_(transform=transform, **kwargs)
 
     logger.info(f"# of dataset samples: {len(dataset):,d}")

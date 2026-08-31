@@ -1,5 +1,6 @@
 MODEL:
-  WEIGHTS: '/home/li_yu/Proj04_he/done_work/dinov2/dinov2/results/dinov2_he1007_pretrain/eval/training_124999/teacher_checkpoint.pth'
+  # Required at launch time. Keep machine-specific paths out of source control.
+  WEIGHTS: ''
 compute_precision:
   grad_scaler: true
   student:
@@ -10,6 +11,18 @@ compute_precision:
         reduce_dtype: fp16
         buffer_dtype: fp32
     spatial_agg:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    local_spatial_agg:
+      sharding_strategy: SHARD_GRAD_OP
+      mixed_precision:
+        param_dtype: fp16
+        reduce_dtype: fp32
+        buffer_dtype: fp32
+    local_crop_fusion:
       sharding_strategy: SHARD_GRAD_OP
       mixed_precision:
         param_dtype: fp16
@@ -43,9 +56,22 @@ feature:
   # One extracted image patch becomes one 1024-D graph node in Stage 2.
   out_dim: 1024
   spatial_agg_hidden: 256
+  local_spatial_agg_hidden: 256
+  local_fusion_hidden: 2048
+  node_fusion_hidden: 2048
   spatial_fusion_alpha: 0.1
+  # Stage 1A: frozen DINO teacher + trainable spatial aggregation/fusion.
+  freeze_backbone: true
+  view_loss_weight: 1.0
+  teacher_loss_weight: 1.0
+  spatial_view_loss_weight: 0.5
+  spatial_teacher_loss_weight: 0.5
+  local_teacher_loss_weight: 0.5
   # Prevent final .npz extraction with a randomly initialized spatial branch.
   require_trained_spatial: true
+  # Enable only when preparing branch-1 caches for the segmentation decoder.
+  # Dense [token,channel] grids are much larger than the pooled graph nodes.
+  export_dense_tokens: false
 train:
   batch_size_per_gpu: 64
   dataset_path: ImageNet:split=TRAIN
@@ -90,9 +116,10 @@ optim:
   adamw_beta2: 0.999
 crops:
   global_crops_scale:
-  - 0.32
+  - 0.8
   - 1.0
-  local_crops_number: 8
+  # Four independent local views are encoded by the dedicated local CNN.
+  local_crops_number: 4
   local_crops_scale:
   - 0.05
   - 0.32

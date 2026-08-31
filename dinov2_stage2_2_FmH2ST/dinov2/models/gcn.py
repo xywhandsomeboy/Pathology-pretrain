@@ -109,6 +109,8 @@ class GCNConv(MessagePassing):
         return norm.view(-1, 1) * (x_j + edge_attr)
 
 class GATConv(MessagePassing):
+    """Legacy edge-aware GAT kept for old experiment configurations."""
+
     def __init__(self, emb_dim, heads=2, negative_slope=0.2, aggr="add", 
                  input_layer=False, edge_dim=None):
         super(GATConv, self).__init__(aggr=aggr,node_dim=0)
@@ -163,7 +165,7 @@ class GATConv(MessagePassing):
         # print("check ",edge_index.shape,edge_embeddings.shape,x.shape) # torch.Size([2, 100]) torch.Size([100, 256]) torch.Size([10, 2, 128])
         return self.propagate(edge_index, x=x, edge_attr=edge_embeddings)
 
-    def message(self, edge_index, x_i, x_j, edge_attr):
+    def message(self, x_i, x_j, edge_attr, edge_index_i, size_i):
         
         edge_attr = edge_attr.view(-1, self.heads, self.emb_dim)
         # print("check ",x_j.shape,edge_attr.shape) # torch.Size([10, 100, 128]) torch.Size([100, 2, 128])
@@ -171,7 +173,10 @@ class GATConv(MessagePassing):
 
         alpha = (torch.cat([x_i, x_j], dim=-1) * self.att).sum(dim=-1)
         alpha = F.leaky_relu(alpha, self.negative_slope)
-        alpha = softmax(alpha, edge_index[0])
+        # PyG propagates edge_index[0] -> edge_index[1]. Normalize all incoming
+        # messages for the same target node, rather than a source node's
+        # outgoing edges.
+        alpha = softmax(alpha, edge_index_i, num_nodes=size_i)
 
         return x_j * alpha.view(-1, self.heads, 1)
 
@@ -179,6 +184,69 @@ class GATConv(MessagePassing):
         aggr_out = aggr_out.mean(dim=1)
         aggr_out = aggr_out + self.bias
         return aggr_out
+
+
+class GATv2Conv(GATConv):
+    """Dynamic edge-aware GATv2 with the same node input/output dimension.
+
+    Unlike legacy GAT, the query, key and pair-specific edge embedding are
+    combined before the non-linearity and final attention projection. This
+    makes the neighbor ranking conditional on the query node. The existing
+    shared node projection keeps the parameter increase small.
+    """
+
+    def __init__(
+        self,
+        emb_dim,
+        heads=2,
+        negative_slope=0.2,
+        aggr="add",
+        input_layer=False,
+        edge_dim=None,
+    ):
+        super().__init__(
+            emb_dim=emb_dim,
+            heads=heads,
+            negative_slope=negative_slope,
+            aggr=aggr,
+            input_layer=input_layer,
+            edge_dim=edge_dim,
+        )
+        self.att = torch.nn.Parameter(torch.empty(1, heads, emb_dim))
+        self.reset_parameters()
+
+    def forward(self, x, edge_index, edge_attr):
+        edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+
+        # Self-loops have maximal affinity in every configured edge channel.
+        self_loop_attr = torch.ones(
+            (x.size(0), self.edge_dim),
+            device=edge_attr.device,
+            dtype=edge_attr.dtype,
+        )
+        edge_attr = torch.cat((edge_attr, self_loop_attr), dim=0)
+        if self.input_layer:
+            x = self.input_node_embeddings(x.to(torch.int64).view(-1))
+        x = self.weight_linear(x).view(-1, self.heads, self.emb_dim)
+        edge_embeddings = self.edge_encoder(edge_attr)
+        return self.propagate(
+            edge_index.to(device=x.device, dtype=torch.long),
+            x=x,
+            edge_attr=edge_embeddings,
+        )
+
+    def message(self, x_i, x_j, edge_attr, edge_index_i, size_i):
+        edge_attr = edge_attr.view(-1, self.heads, self.emb_dim)
+        value = x_j + edge_attr
+        attention_input = x_i + value
+
+        # GATv2 ordering mixes query and key before the non-linearity, so the
+        # neighbor ranking can change with the query node.
+        alpha = (
+            F.leaky_relu(attention_input, self.negative_slope) * self.att
+        ).sum(dim=-1)
+        alpha = softmax(alpha, edge_index_i, num_nodes=size_i)
+        return value * alpha.unsqueeze(-1)
 
 
 class GraphSAGEConv(MessagePassing):
@@ -335,8 +403,9 @@ class GNN(torch.nn.Module):
             elif gnn_type == "gcn":
                 raw_layers.append(GCNConv(emb_dim, input_layer=input_layer))
             elif gnn_type == "gat":
-                # assume your custom GATConv class defined earlier - rename if needed
                 raw_layers.append(GATConv(emb_dim, input_layer=input_layer, edge_dim=edge_dim))
+            elif gnn_type == "gatv2":
+                raw_layers.append(GATv2Conv(emb_dim, input_layer=input_layer, edge_dim=edge_dim))
             elif gnn_type == "graphsage":
                 raw_layers.append(GraphSAGEConv(emb_dim, input_layer=input_layer))
             else:
@@ -468,5 +537,3 @@ class GNN_graphpred(torch.nn.Module):
 def gnn(**kwargs):
     model = GNN(**kwargs)
     return model
-
-

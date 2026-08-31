@@ -62,12 +62,13 @@ gcn:
   # [spatial_weight, semantic_weight], kept separate for the GNN.
   edge_dim: 2
   dropout_ratio: 0
-  gnn_type: "gat"
+  # Dynamic attention; legacy "gat" remains available for old experiments.
+  gnn_type: "gatv2"
   block_chunks: 1
   use_residual: true
   use_layernorm: true
-  # Exact-ratio random, spatial-region and random-walk Graph-MAE masks.
-  mask_strategy: "node"
+  # Exact-ratio random, spatial-region and random-walk Graph-MAE masks are all
+  # optimized together; there is no second dataset-side mask strategy.
   node_mask_ratio: 0.3
   node_recon_weight: 1.0
   node_recon_mse_weight: 1.0
@@ -80,7 +81,8 @@ gcn:
   reliable_neg_distance_ratio: 2.0
   reliable_neg_visual_sim_max: 0.2
   reliable_neg_context_sim_max: 0.2
-  # Weak noisy views retain almost all graph topology.
+  # Contrastive views use moderate pairwise DropEdge while retaining at least
+  # two spatial neighbours per node whenever the original graph has them.
   contrast_weight: 1.0
   contrast_temperature: 0.5
   contrast_proj_dim: 128
@@ -88,7 +90,8 @@ gcn:
   feature_noise_std: 0.05
   edge_weight_noise_std: 0.02
   contrast_feature_mask_ratio: 0.05
-  view_edge_drop: 0.01
+  view_edge_drop: 0.05
+  contrast_min_neighbors: 2
 optim:
   epochs: 400
   weight_decay: 0.04

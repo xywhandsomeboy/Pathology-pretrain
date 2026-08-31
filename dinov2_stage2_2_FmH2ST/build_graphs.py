@@ -1,0 +1,85 @@
+"""Build canonical Stage-2 graphs from paired ``*_features.npy``/``*_coords.npy`` files.
+
+The historical notebook is intentionally not imported. Optional
+``<slide>_metadata.pt`` dictionaries provide lightweight ``patch_ids`` and
+``levels`` when the graphs will later feed the segmentation decoder. Dense
+tokens deliberately remain outside PyG graph files.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from dinov2.data.datasets.graph_builder import build_pyg_graph, validate_graph_schema
+
+
+def _load(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def build_all(args) -> tuple[int, int]:
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    built = skipped = 0
+    for feature_path in sorted(args.embeddings_dir.glob("*_features.npy")):
+        slide_id = feature_path.name[: -len("_features.npy")]
+        coords_path = args.embeddings_dir / f"{slide_id}_coords.npy"
+        if not coords_path.is_file():
+            raise FileNotFoundError(f"Missing coordinate pair for {feature_path.name}")
+        output_path = args.output_dir / f"{slide_id}.pt"
+        if output_path.exists() and not args.overwrite:
+            skipped += 1
+            continue
+
+        metadata = {}
+        if args.metadata_dir is not None:
+            metadata_path = args.metadata_dir / f"{slide_id}_metadata.pt"
+            if metadata_path.is_file():
+                metadata = _load(metadata_path)
+                if not isinstance(metadata, dict):
+                    raise TypeError(f"Metadata must be a dictionary: {metadata_path}")
+        graph = build_pyg_graph(
+            np.load(coords_path),
+            np.load(feature_path),
+            k=args.k,
+            max_distance=args.max_distance,
+            distance_multiplier=args.distance_multiplier,
+            patch_ids=metadata.get("patch_ids"),
+            levels=metadata.get("levels"),
+            slide_id=slide_id,
+        )
+        validate_graph_schema(
+            graph,
+            require_decoder_metadata=args.require_decoder_metadata,
+        )
+        temporary_path = output_path.with_suffix(".pt.tmp")
+        torch.save(graph, temporary_path)
+        temporary_path.replace(output_path)
+        built += 1
+    return built, skipped
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--embeddings-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--metadata-dir", type=Path)
+    parser.add_argument("--k", type=int, default=8)
+    parser.add_argument("--max-distance", type=float)
+    parser.add_argument("--distance-multiplier", type=float, default=3.0)
+    parser.add_argument("--require-decoder-metadata", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
+    args = parser.parse_args()
+
+    built, skipped = build_all(args)
+    print(f"Built {built} graphs; skipped {skipped} existing graphs")
+
+
+if __name__ == "__main__":
+    main()

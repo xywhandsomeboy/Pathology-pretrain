@@ -1,18 +1,35 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #SBATCH --partition=gpu
 #SBATCH --nodes=1
-#SBATCH --ntasks=4           # 4 tasks * 4 nodes = 16
-#SBATCH --ntasks-per-node=4   # 4 tasks on each node
-#SBATCH --gres=gpu:4          # 4 GPUs per node
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
 #SBATCH --output=Job.%j.out
 #SBATCH --error=Job.%j.err
-#SBATCH --chdir=/home/li_yu/Proj04_he/done_work/dinov2
 
-python  dinov2/run/train/train.py \
-  --nnodes=1 \
-  --ngpus=1 \
+set -euo pipefail
+
+stage2_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+workspace_dir="$(cd "${stage2_dir}/.." && pwd)"
+python_bin="${PYTHON_BIN:-${workspace_dir}/dinov2/.venv/bin/python}"
+graph_root="${GRAPH_ROOT:-${workspace_dir}/Graph/graphs-current}"
+output_dir="${OUTPUT_DIR:-${stage2_dir}/dinov2/results/stage2_graph_pretrain}"
+gpu_id="${GPU_ID:-0}"
+
+for required in "${python_bin}" "${graph_root}"; do
+  if [[ ! -e "${required}" ]]; then
+    echo "Missing required Stage-2 resource: ${required}" >&2
+    exit 1
+  fi
+done
+if ! "${python_bin}" -c "import torch_geometric" >/dev/null 2>&1; then
+  echo "The selected PYTHON_BIN does not provide torch_geometric." >&2
+  exit 2
+fi
+
+cd "${stage2_dir}"
+export CUDA_VISIBLE_DEVICES="${gpu_id}"
+exec "${python_bin}" -m dinov2.train.train \
   --no-resume \
-  --partition=gpu \
   --config-file dinov2/configs/train/vitl16_short.yaml \
-  --output-dir dinov2/results/gcn_1112_pretrain_embeddings-1024 \
-  train.dataset_path=ImageFolder:root=/home/li_yu/Proj04_he/HE_DNAMeth/multimodel_data/HE/ImageNet_like/Graph-1024-251111-thre0.8
+  --output-dir "${output_dir}" \
+  train.dataset_path="ImageFolder:root=${graph_root}:edge_dim=2"

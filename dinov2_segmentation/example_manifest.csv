@@ -1,0 +1,2 @@
+slide_id,patch_id,x,y,level,image_path,mask_path,feature_path,feature_index
+TCGA-example,TCGA-example_x0_y0,0,0,0,patches/TCGA-example_x0_y0.png,masks/TCGA-example_x0_y0.png,features/TCGA-example.pt,0

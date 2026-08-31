@@ -49,7 +49,15 @@ def _parse_dataset_str(dataset_str: str):
 
     for token in tokens[1:]:
         key, value = token.split("=")
-        assert key in ("root", "extra", "split")
+        assert key in (
+            "root",
+            "extra",
+            "split",
+            "max_patches",
+            "sampling",
+            "metadata_csv",
+            "patch_root",
+        )
         kwargs[key] = value
 
     if name == "ImageNet":
