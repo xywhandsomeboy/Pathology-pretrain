@@ -10,8 +10,8 @@
 | `legacy/dinov2_stage2_2_FmH2ST_finetune/` | 只读参考 | 面向旧分类任务，不是当前 segmentation decoder |
 | `graph_build.ipynb` | 实验记录 | 包含多套重复函数和旧绝对路径，已由 `build_graphs.py` 取代 |
 | 旧 `.npz`/`.npy` | Stage 2 兼容 | 没有完整身份字段，不能单独供分割对齐 |
-| 旧 PyG `.pt` | 旧 Stage 2 兼容 | `Graph-1024-251111-thre0.8` 的边是单通道，不能用于当前双通道 Stage 2，也不能直接建分割缓存 |
-| 旧 Stage 2 checkpoint | 只读参考 | 由单通道边和旧代理任务训练，不能加载到当前双通道多任务模型 |
+| 旧 PyG `.pt` | 旧 Stage 2 兼容 | `Graph-1024-251111-thre0.8` 的边是单通道，既不是当前 `dual` 二维边权图，也不是 `distance` 无权图，不能直接用于三个新版本 |
+| 旧 Stage 2 checkpoint | 只读参考 | 由单通道边和旧代理任务训练，不能加载到当前三个 Stage 2 版本 |
 
 由于每个 fork 都提供顶层包 `dinov2`，不要把多个 fork 同时加入 `PYTHONPATH`。运行
 Stage 1/Stage 2 时进入对应目录；运行 `dinov2_segmentation` 时回到仓库根目录。

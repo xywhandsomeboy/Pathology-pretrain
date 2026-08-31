@@ -115,7 +115,8 @@ class GATConv(MessagePassing):
                  input_layer=False, edge_dim=None):
         super(GATConv, self).__init__(aggr=aggr,node_dim=0)
 
-        assert edge_dim is not None, "必须在初始化时指定 edge_dim（边特征维度）"
+        if edge_dim is None or int(edge_dim) < 0:
+            raise ValueError("edge_dim must be a non-negative integer")
 
         self.emb_dim = emb_dim
         self.heads = heads
@@ -127,7 +128,11 @@ class GATConv(MessagePassing):
         self.bias = torch.nn.Parameter(torch.Tensor(emb_dim))
 
         # 边特征映射层
-        self.edge_encoder = torch.nn.Linear(self.edge_dim, heads * emb_dim)
+        self.edge_encoder = (
+            torch.nn.Linear(self.edge_dim, heads * emb_dim)
+            if self.edge_dim > 0
+            else None
+        )
 
         # 输入离散节点特征时的 embedding
         self.input_layer = input_layer
@@ -142,6 +147,8 @@ class GATConv(MessagePassing):
         zeros(self.bias)
 
     def forward(self, x, edge_index, edge_attr):
+        if self.edge_encoder is None:
+            raise ValueError("Legacy GAT requires edge_attr with edge_dim > 0")
         # add self-loops
         edge_index,_ = add_self_loops(edge_index, num_nodes=x.size(0))
         
@@ -204,7 +211,6 @@ class GATv2Conv(GATConv):
         input_layer=False,
         edge_dim=None,
         edge_injection="message_and_attention",
-        spatial_bias_init=0.0,
     ):
         super().__init__(
             emb_dim=emb_dim,
@@ -215,52 +221,59 @@ class GATv2Conv(GATConv):
             edge_dim=edge_dim,
         )
         self.att = torch.nn.Parameter(torch.empty(1, heads, emb_dim))
-        allowed = {"message_and_attention", "attention_bias"}
+        allowed = {"message_and_attention", "none"}
         if edge_injection not in allowed:
             raise ValueError(
                 f"Unsupported GATv2 edge_injection={edge_injection!r}; "
                 f"expected one of {sorted(allowed)}"
             )
-        if edge_injection == "attention_bias" and edge_dim != 1:
-            raise ValueError("attention_bias requires a one-dimensional spatial edge_attr")
+        if edge_injection == "message_and_attention" and edge_dim <= 0:
+            raise ValueError("message_and_attention requires edge_dim > 0")
+        if edge_injection == "none" and edge_dim != 0:
+            raise ValueError("edge_injection='none' requires edge_dim=0")
         self.edge_injection = edge_injection
-        if edge_injection == "attention_bias":
-            # The spatial-only variant uses the scalar distance affinity as an
-            # additive attention prior; it must not also enter the message value.
-            self.edge_encoder = None
-            self.spatial_beta = torch.nn.Parameter(
-                torch.tensor(float(spatial_bias_init))
-            )
-        else:
-            self.spatial_beta = None
         self.reset_parameters()
 
-    def forward(self, x, edge_index, edge_attr):
+    def forward(self, x, edge_index, edge_attr, use_edge_attr=None):
         edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
 
-        # Self-loops have maximal affinity in every configured edge channel.
-        self_loop_attr = torch.ones(
-            (x.size(0), self.edge_dim),
-            device=edge_attr.device,
-            dtype=edge_attr.dtype,
-        )
-        edge_attr = torch.cat((edge_attr, self_loop_attr), dim=0)
+        if use_edge_attr is None:
+            use_edge_attr = self.edge_injection != "none"
+        if use_edge_attr:
+            if self.edge_injection == "none" or self.edge_encoder is None:
+                raise ValueError("This GATv2 layer was built without edge-weight support")
+            if edge_attr is None:
+                raise ValueError("Weighted GATv2 requires edge_attr")
+            if edge_attr.ndim == 1:
+                edge_attr = edge_attr.unsqueeze(-1)
+            if edge_attr.size(-1) != self.edge_dim:
+                raise ValueError(
+                    f"Expected {self.edge_dim}-D edge_attr, got {edge_attr.size(-1)}"
+                )
+            # Self-loops have maximal affinity in every configured channel.
+            self_loop_attr = torch.ones(
+                (x.size(0), self.edge_dim),
+                device=edge_attr.device,
+                dtype=edge_attr.dtype,
+            )
+            edge_attr = self.edge_encoder(
+                torch.cat((edge_attr, self_loop_attr), dim=0)
+            )
+        else:
+            # Version 2 uses this path during pretraining and inference.
+            # Version 3 uses it only for post-pretraining context export.
+            edge_attr = None
         if self.input_layer:
             x = self.input_node_embeddings(x.to(torch.int64).view(-1))
         x = self.weight_linear(x).view(-1, self.heads, self.emb_dim)
-        propagated_edge_attr = (
-            self.edge_encoder(edge_attr)
-            if self.edge_injection == "message_and_attention"
-            else edge_attr
-        )
         return self.propagate(
             edge_index.to(device=x.device, dtype=torch.long),
             x=x,
-            edge_attr=propagated_edge_attr,
+            edge_attr=edge_attr,
         )
 
     def message(self, x_i, x_j, edge_attr, edge_index_i, size_i):
-        if self.edge_injection == "message_and_attention":
+        if edge_attr is not None:
             edge_embedding = edge_attr.view(-1, self.heads, self.emb_dim)
             value = x_j + edge_embedding
             attention_input = x_i + value
@@ -273,15 +286,6 @@ class GATv2Conv(GATConv):
         alpha = (
             F.leaky_relu(attention_input, self.negative_slope) * self.att
         ).sum(dim=-1)
-        if self.edge_injection == "attention_bias":
-            spatial_weight = edge_attr.reshape(-1).clamp_min(
-                torch.finfo(edge_attr.dtype).eps
-            )
-            alpha = (
-                alpha
-                + self.spatial_beta.to(alpha.dtype)
-                * spatial_weight.log().unsqueeze(-1)
-            )
         alpha = softmax(alpha, edge_index_i, num_nodes=size_i)
         return value * alpha.unsqueeze(-1)
 
@@ -418,7 +422,6 @@ class GNN(torch.nn.Module):
         use_residual=True,
         use_layernorm=True,
         edge_injection="message_and_attention",
-        spatial_bias_init=0.0,
     ):
         super(GNN, self).__init__()
         self.num_layer = num_layer
@@ -428,6 +431,7 @@ class GNN(torch.nn.Module):
         self.block_chunks = block_chunks
         self.use_residual = use_residual
         self.use_layernorm = use_layernorm
+        self.gnn_type = gnn_type
 
         if self.num_layer < 2:
             raise ValueError("Number of GNN layers must be greater than 1.")
@@ -450,7 +454,6 @@ class GNN(torch.nn.Module):
                         input_layer=input_layer,
                         edge_dim=edge_dim,
                         edge_injection=edge_injection,
-                        spatial_bias_init=spatial_bias_init,
                     )
                 )
             elif gnn_type == "graphsage":
@@ -473,7 +476,7 @@ class GNN(torch.nn.Module):
             self.chunked = False
             self.gnns = torch.nn.ModuleList(raw_layers)
 
-    def forward(self, x, edge_index, edge_attr):
+    def forward(self, x, edge_index, edge_attr, use_edge_attr=None):
         """
         We must preserve the previous behavior: collect each layer's output into h_list.
         If chunked: self.gnns is ModuleList of GNNChunk (which are ModuleList of layers).
@@ -484,7 +487,19 @@ class GNN(torch.nn.Module):
             # same as original
             for layer in range(self.num_layer):
                 h_in = h_list[layer]
-                h = self.gnns[layer](h_in, edge_index, edge_attr)
+                if self.gnn_type == "gatv2":
+                    h = self.gnns[layer](
+                        h_in,
+                        edge_index,
+                        edge_attr,
+                        use_edge_attr=use_edge_attr,
+                    )
+                else:
+                    if use_edge_attr is False:
+                        raise ValueError(
+                            "Runtime edge-attribute bypass is implemented only for GATv2"
+                        )
+                    h = self.gnns[layer](h_in, edge_index, edge_attr)
                 if self.use_residual and h.shape == h_in.shape:
                     h = h + h_in
                 if self.use_layernorm:
@@ -500,7 +515,19 @@ class GNN(torch.nn.Module):
             for chunk in self.gnns:
                 for layer in chunk:
                     h_in = h_list[layer_idx]
-                    h = layer(h_in, edge_index, edge_attr)
+                    if self.gnn_type == "gatv2":
+                        h = layer(
+                            h_in,
+                            edge_index,
+                            edge_attr,
+                            use_edge_attr=use_edge_attr,
+                        )
+                    else:
+                        if use_edge_attr is False:
+                            raise ValueError(
+                                "Runtime edge-attribute bypass is implemented only for GATv2"
+                            )
+                        h = layer(h_in, edge_index, edge_attr)
                     if self.use_residual and h.shape == h_in.shape:
                         h = h + h_in
                     if self.use_layernorm:

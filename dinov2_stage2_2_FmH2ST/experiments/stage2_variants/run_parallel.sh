@@ -6,7 +6,7 @@ experiment_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 stage2_dir="$(cd "${experiment_dir}/../.." && pwd)"
 run_id="${1:-}"
 variant_gpu0="${2:-baseline}"
-variant_gpu1="${3:-spatial_only}"
+variant_gpu1="${3:-distance_only}"
 gpu0_id="${GPU0_ID:-0}"
 gpu1_id="${GPU1_ID:-1}"
 

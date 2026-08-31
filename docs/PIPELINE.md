@@ -46,23 +46,24 @@ Stage-1A 权重。
 
 新建图入口是 `dinov2_stage2_2_FmH2ST/build_graphs.py`。它读取同名的
 `*_features.npy`、`*_coords.npy` 和可选 `*_metadata.pt`，使用空间 KNN 候选和
-物理距离上限建立边：
+物理距离上限建立边。`edge_index` 的存在与否始终只由坐标决定，支持两种 schema：
 
-- 边通道 0：空间高斯权重。
-- 边通道 1：节点特征余弦相似度映射到 `[0, 1]`。
+- `dual`：边通道 0 是空间高斯权重，边通道 1 是节点特征余弦相似度映射到
+  `[0, 1]`；
+- `distance`：使用相同空间拓扑，但完全不保存 `edge_attr`。
 
-`edge_index` 的存在与否只由坐标 KNN 和物理距离上限决定；余弦相似度仅是已存在边的
-属性，不会产生语义远程边。主线图编码器使用带双通道边属性的 GATv2：先联合目标节点、
-来源节点和边嵌入，再计算动态注意力，并按目标节点的入边归一化。外层仍保留残差、
-LayerNorm 和 JK-Sum，节点输入输出维度均为 1024。
+余弦相似度只可能成为 `dual` 已存在边的属性，不会产生语义远程边。原版图编码器
+使用带双通道边属性的 GATv2；纯距离版本使用同一个 GATv2 主体但不输入静态边权。
+两者都根据节点特征计算动态注意力并按目标节点的入边归一化。外层仍保留残差、
+LayerNorm 和 JK-Sum，节点输入输出维度均为 1024。三个正式版本的准确边界见
+`dinov2_stage2_2_FmH2ST/experiments/stage2_variants/README.md`。
 
 `graph_build.ipynb` 是历史实验记录，不再作为生产入口。Stage 2 遮掩和噪声视图只在
 `GCNMetaArch` 中生成，数据集不再执行第二套 mask。
 
-仓库现有 `Graph-1024-251111-thre0.8` 是单通道旧图。当前配置 `gcn.edge_dim=2`，
-必须先从 Stage1 整理后的 per-slide arrays 运行 `build_graphs.py` 生成
-`Graph/graphs-current`；
-加载器会拒绝把旧图静默当成新图。
+仓库现有 `Graph-1024-251111-thre0.8` 是单通道旧图，既不满足原版 `dual` 的二维
+schema，也不满足 `distance` 的无属性 schema。必须先从 Stage1 整理后的 per-slide
+arrays 运行 `build_graphs.py` 重新生成；加载器会拒绝把旧图静默当成新图。
 
 图训练入口是 `pretrain.sh`，通过 `GRAPH_ROOT` 指定图目录，并通过 `PYTHON_BIN`
 选择安装了 PyG 的环境。
@@ -81,8 +82,9 @@ LayerNorm 和 JK-Sum，节点输入输出维度均为 1024。
 语义及节点一一对应关系。
 
 维护入口 `export_context.py` 会直接读取磁盘上的完整图，不经过训练数据集，并把
-`patch_ids` 与 context 一起保存。它要求与当前架构兼容的合并后 Stage 2 checkpoint；
-旧单通道图任务的 checkpoint 不兼容。
+`patch_ids` 与 context 一起保存。导出必须使用该次训练保存的解析后配置；程序会核对
+配置要求的 `context_edge_mode` 与完整图，避免 `dual`/`distance` 混用。旧单通道图
+任务的 checkpoint 不兼容。
 
 ## 5. 分割网络
 

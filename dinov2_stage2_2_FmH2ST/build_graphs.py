@@ -58,7 +58,7 @@ def build_all(args) -> tuple[int, int]:
         )
         validate_graph_schema(
             graph,
-            expected_edge_dim=2 if args.edge_mode == "dual" else 1,
+            expected_edge_dim=2 if args.edge_mode == "dual" else 0,
             require_decoder_metadata=args.require_decoder_metadata,
         )
         temporary_path = output_path.with_suffix(".pt.tmp")
@@ -76,7 +76,7 @@ def main():
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--max-distance", type=float)
     parser.add_argument("--distance-multiplier", type=float, default=3.0)
-    parser.add_argument("--edge-mode", choices=("dual", "spatial"), default="dual")
+    parser.add_argument("--edge-mode", choices=("dual", "distance"), default="dual")
     parser.add_argument("--require-decoder-metadata", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -85,7 +85,8 @@ def main():
     requested_manifest = {
         "format_version": 1,
         "edge_mode": args.edge_mode,
-        "edge_dim": 2 if args.edge_mode == "dual" else 1,
+        "edge_dim": 2 if args.edge_mode == "dual" else 0,
+        "edge_attr_present": args.edge_mode == "dual",
         "embeddings_dir": str(args.embeddings_dir.expanduser().resolve()),
         "metadata_dir": (
             str(args.metadata_dir.expanduser().resolve())

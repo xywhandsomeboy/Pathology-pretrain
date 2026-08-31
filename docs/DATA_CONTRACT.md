@@ -33,7 +33,11 @@
 
 ## Stage 2 graph
 
-新图必须包含 `x [N,C]`、`edge_index [2,E]`、`edge_attr [E,2]` 和 `pos [N,2]`。
+新图都必须包含 `x [N,C]`、`edge_index [2,E]`、`pos [N,2]` 和 `edge_mode`：
+
+- `edge_mode="dual"`：必须包含 `edge_attr [E,2]`，依次为空间高斯权重与语义权重；
+- `edge_mode="distance"`：不保存 `edge_attr`，边只由坐标 KNN 与最大距离过滤得到。
+
 用于分割时还必须包含 `patch_ids`、`levels` 与 `slide_id`。`dense_tokens` 不写进图，
 而是由 Stage1 独立保存，防止图训练与 context 导出读取巨大的 decoder 张量。
 

@@ -61,10 +61,12 @@ gcn:
   JK: "sum"
   # [spatial_weight, semantic_weight], kept separate for the GNN.
   edge_dim: 2
-  # Baseline injects encoded edge features into both attention and messages.
-  # Stage-2 experiment configs may select "attention_bias" with edge_dim=1.
+  # The baseline injects encoded edge features into attention and messages.
+  # The distance-only variant sets edge_dim=0 and edge_injection="none".
   edge_injection: "message_and_attention"
-  spatial_bias_init: 0.0
+  # Version 3 trains with baseline weights, then bypasses them during export.
+  context_edge_mode: "dual"
+  context_use_edge_attr: true
   dropout_ratio: 0
   # Dynamic attention; legacy "gat" remains available for old experiments.
   gnn_type: "gatv2"
@@ -81,6 +83,7 @@ gcn:
   edge_mask_ratio: 0.3
   negatives_per_positive: 2
   edge_existence_weight: 1.0
+  edge_weight_objective: true
   edge_weight_weight: 0.1
   reliable_neg_distance_ratio: 2.0
   reliable_neg_visual_sim_max: 0.2

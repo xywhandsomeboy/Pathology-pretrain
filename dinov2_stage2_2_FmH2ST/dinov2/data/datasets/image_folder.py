@@ -34,7 +34,7 @@ def _lean_training_graph(graph: Data, max_nodes: int) -> Data:
     edge_index, edge_attr = subgraph(
         node_indices,
         graph.edge_index,
-        graph.edge_attr,
+        getattr(graph, "edge_attr", None),
         relabel_nodes=True,
         num_nodes=count,
     )
@@ -73,6 +73,8 @@ class ImageFolder(Dataset):
         self.edge_dim = int(edge_dim)
         if self.max_nodes < 0:
             raise ValueError("max_nodes must be >= 0; use 0 for complete graphs")
+        if self.edge_dim < 0:
+            raise ValueError("edge_dim must be >= 0; use 0 for an unweighted graph")
 
         candidates = sorted(self.root.glob("*.pt"))
         valid: list[tuple[Path, int, int]] = []
@@ -85,10 +87,12 @@ class ImageFolder(Dataset):
             if not isinstance(graph, Data) or graph.x is None or graph.edge_index is None:
                 logger.warning("Skipping non-PyG or incomplete graph %s", path.name)
                 continue
-            if graph.edge_attr is None:
-                logger.warning("Skipping graph without edge_attr: %s", path.name)
-                continue
-            actual_edge_dim = 1 if graph.edge_attr.ndim == 1 else graph.edge_attr.size(-1)
+            edge_attr = getattr(graph, "edge_attr", None)
+            actual_edge_dim = (
+                0
+                if edge_attr is None
+                else (1 if edge_attr.ndim == 1 else edge_attr.size(-1))
+            )
             if actual_edge_dim != self.edge_dim:
                 logger.warning(
                     "Skipping %s: edge_dim=%d, expected %d. Rebuild it with build_graphs.py.",

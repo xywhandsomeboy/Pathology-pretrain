@@ -18,7 +18,7 @@ def collate_data_and_cast(samples_list, dtype=torch.float32):
             raise TypeError(f"Expected torch_geometric.data.Data, got {type(graph)}")
         graph = graph.clone()
         graph.x = graph.x.to(dtype=dtype)
-        if graph.edge_attr is not None:
+        if getattr(graph, "edge_attr", None) is not None:
             graph.edge_attr = graph.edge_attr.to(dtype=dtype)
         graphs.append(graph)
         slide_names.append(str(sample["slide_name"]))

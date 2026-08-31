@@ -107,6 +107,9 @@ optim:
   lr: 0.  # will be set after applying scaling rule
   warmup_epochs: 10
   min_lr: 1.0e-06
+  # 0 keeps one cosine decay across the full run; a positive value enables
+  # fixed-period cosine restarts aligned to global epochs.
+  cosine_cycle_epochs: 0
   clip_grad: 3.0
   freeze_last_layer_epochs: 1
   scaling_rule: sqrt_wrt_1024

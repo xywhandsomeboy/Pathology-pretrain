@@ -23,7 +23,6 @@ def build_model(args):
             use_residual=getattr(args, "use_residual", True),
             use_layernorm=getattr(args, "use_layernorm", True),
             edge_injection=getattr(args, "edge_injection", "message_and_attention"),
-            spatial_bias_init=getattr(args, "spatial_bias_init", 0.0),
         )
         
         student = gnn.__dict__[args.arch](**gnn_kwargs,)

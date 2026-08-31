@@ -33,14 +33,25 @@ class GCNMetaArch(nn.Module):
         self.fp16_scaler = ShardedGradScaler() if cfg.compute_precision.grad_scaler else None
         gcn, dim = build_model_from_cfg(cfg)
         pair_dim = dim * 3
-        self.student = nn.ModuleDict({
+        self.edge_weight_objective = bool(
+            getattr(cfg.gcn, "edge_weight_objective", True)
+        )
+        if self.edge_weight_objective and int(cfg.gcn.edge_dim) <= 0:
+            raise ValueError("The edge-weight objective requires edge_dim > 0")
+        student_modules = {
             "gcn": gcn,
             "mask_token": LearnableMaskToken(dim),
             "node_decoder": nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim)),
             "projection": nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, cfg.gcn.contrast_proj_dim)),
             "edge_existence_head": nn.Sequential(nn.Linear(pair_dim, dim), nn.GELU(), nn.Linear(dim, 1)),
-            "edge_weight_head": nn.Sequential(nn.Linear(pair_dim, dim), nn.GELU(), nn.Linear(dim, cfg.gcn.edge_dim)),
-        })
+        }
+        if self.edge_weight_objective:
+            student_modules["edge_weight_head"] = nn.Sequential(
+                nn.Linear(pair_dim, dim),
+                nn.GELU(),
+                nn.Linear(dim, cfg.gcn.edge_dim),
+            )
+        self.student = nn.ModuleDict(student_modules)
         self.need_to_synchronize_fsdp_streams = True
         logger.info("Offline graph pretraining model built with %d-D nodes", dim)
 
@@ -58,24 +69,45 @@ class GCNMetaArch(nn.Module):
         device = next(self.student.parameters()).device
         x = graph.x.to(device)
         edge_index = graph.edge_index.to(device)
-        edge_attr = graph.edge_attr
-        if edge_attr is None:
-            edge_attr = torch.ones(
-                (edge_index.size(1), self.cfg.gcn.edge_dim),
-                device=device,
-                dtype=x.dtype,
-            )
-        else:
-            edge_attr = edge_attr.to(device)
-        if edge_attr.ndim == 1:
-            edge_attr = edge_attr.unsqueeze(-1)
-        if edge_attr.size(-1) != self.cfg.gcn.edge_dim:
+        expected_edge_mode = str(
+            getattr(self.cfg.gcn, "context_edge_mode", "dual")
+        )
+        declared_edge_mode = getattr(graph, "edge_mode", None)
+        if (
+            declared_edge_mode is not None
+            and str(declared_edge_mode) != expected_edge_mode
+        ):
             raise ValueError(
-                f"Expected {self.cfg.gcn.edge_dim}-D edge_attr, got {edge_attr.size(-1)}"
+                f"Expected context graph edge_mode={expected_edge_mode!r}, got "
+                f"{str(declared_edge_mode)!r}"
             )
+        use_edge_attr = bool(getattr(self.cfg.gcn, "context_use_edge_attr", True))
+        edge_attr = getattr(graph, "edge_attr", None)
+        if use_edge_attr:
+            if edge_attr is None:
+                edge_attr = torch.ones(
+                    (edge_index.size(1), self.cfg.gcn.edge_dim),
+                    device=device,
+                    dtype=x.dtype,
+                )
+            else:
+                edge_attr = edge_attr.to(device)
+            if edge_attr.ndim == 1:
+                edge_attr = edge_attr.unsqueeze(-1)
+            if edge_attr.size(-1) != self.cfg.gcn.edge_dim:
+                raise ValueError(
+                    f"Expected {self.cfg.gcn.edge_dim}-D edge_attr, got {edge_attr.size(-1)}"
+                )
+        else:
+            edge_attr = None
         # Move only graph-computation tensors. Patch identities and any legacy
         # decoder metadata remain on CPU.
-        return self.student.gcn(x, edge_index, edge_attr)
+        return self.student.gcn(
+            x,
+            edge_index,
+            edge_attr,
+            use_edge_attr=use_edge_attr,
+        )
 
     def backprop_loss(self, loss):
         (self.fp16_scaler.scale(loss) if self.fp16_scaler is not None else loss).backward()
@@ -196,11 +228,18 @@ class GCNMetaArch(nn.Module):
         x = graph.x + torch.randn_like(graph.x) * self.cfg.gcn.feature_noise_std
         if self.cfg.gcn.contrast_feature_mask_ratio > 0:
             x *= (torch.rand_like(x) >= self.cfg.gcn.contrast_feature_mask_ratio).to(x.dtype)
-        edge_attr = graph.edge_attr.clone()
-        if edge_attr.numel() and self.cfg.gcn.edge_weight_noise_std > 0:
+        edge_attr = (
+            graph.edge_attr.clone() if graph.edge_attr is not None else None
+        )
+        if (
+            edge_attr is not None
+            and edge_attr.numel()
+            and self.cfg.gcn.edge_weight_noise_std > 0
+        ):
             edge_attr *= 1 + torch.randn_like(edge_attr) * self.cfg.gcn.edge_weight_noise_std
         keep = self._contrast_edge_keep_mask(graph.edge_index, graph.x.size(0))
-        return self.student.gcn(x, graph.edge_index[:, keep], edge_attr[keep])
+        kept_edge_attr = edge_attr[keep] if edge_attr is not None else None
+        return self.student.gcn(x, graph.edge_index[:, keep], kept_edge_attr)
 
     def _reliable_negatives(self, graph, visual_h, context_h, pairs):
         visual = F.normalize(visual_h.float(), dim=-1)
@@ -240,7 +279,10 @@ class GCNMetaArch(nn.Module):
         directed = torch.sort(graph.edge_index.t(), dim=1).values
         directed_key = directed[:, 0] * graph.x.size(0) + directed[:, 1]
         keep = ~torch.isin(directed_key, selected_key)
-        h = self.student.gcn(graph.x, graph.edge_index[:, keep], graph.edge_attr[keep])
+        kept_edge_attr = (
+            graph.edge_attr[keep] if graph.edge_attr is not None else None
+        )
+        h = self.student.gcn(graph.x, graph.edge_index[:, keep], kept_edge_attr)
         candidates = torch.triu(negatives, diagonal=1).nonzero()
         if candidates.numel():
             candidates = candidates[torch.randperm(candidates.size(0), device=graph.x.device)]
@@ -252,6 +294,8 @@ class GCNMetaArch(nn.Module):
             existence = F.binary_cross_entropy_with_logits(logits, labels)
         else:
             existence = zero
+        if not self.edge_weight_objective:
+            return existence, zero
         targets = []
         for pair in positive:
             match = (directed == pair).all(dim=1).nonzero(as_tuple=False)[0, 0]
@@ -269,7 +313,7 @@ class GCNMetaArch(nn.Module):
             edge_index=source_graph.edge_index.to(device),
             edge_attr=(
                 source_graph.edge_attr.to(device)
-                if source_graph.edge_attr is not None
+                if getattr(source_graph, "edge_attr", None) is not None
                 else None
             ),
             pos=(
@@ -278,16 +322,22 @@ class GCNMetaArch(nn.Module):
                 else None
             ),
         )
+        expected_edge_dim = int(self.cfg.gcn.edge_dim)
         if graph.edge_attr is None:
-            graph.edge_attr = torch.ones((graph.edge_index.size(1), self.cfg.gcn.edge_dim), device=graph.x.device)
-        if graph.edge_attr.ndim == 1:
-            graph.edge_attr = graph.edge_attr.unsqueeze(-1)
-        if graph.edge_attr.size(-1) != self.cfg.gcn.edge_dim:
-            raise ValueError(
-                f"Expected {self.cfg.gcn.edge_dim}-D edge_attr, got "
-                f"{graph.edge_attr.size(-1)}. Rebuild old .pt graphs with "
-                "build_graphs.py using the edge mode required by this variant."
-            )
+            if expected_edge_dim != 0:
+                graph.edge_attr = torch.ones(
+                    (graph.edge_index.size(1), expected_edge_dim),
+                    device=graph.x.device,
+                )
+        else:
+            if graph.edge_attr.ndim == 1:
+                graph.edge_attr = graph.edge_attr.unsqueeze(-1)
+            if graph.edge_attr.size(-1) != expected_edge_dim:
+                raise ValueError(
+                    f"Expected {expected_edge_dim}-D edge_attr, got "
+                    f"{graph.edge_attr.size(-1)}. Rebuild old .pt graphs with "
+                    "build_graphs.py using the edge mode required by this variant."
+                )
         pairs = self._unique_pairs(graph.edge_index)
         node_loss, details = self._node_reconstruction(graph, pairs)
         h1, h2 = self._noisy_view(graph), self._noisy_view(graph)

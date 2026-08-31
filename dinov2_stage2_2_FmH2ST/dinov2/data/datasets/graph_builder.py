@@ -1,8 +1,8 @@
 """Build WSI patch graphs for Stage 2.
 
 Edges are spatial KNN candidates filtered by a maximum physical distance.
-The baseline stores [spatial_weight, semantic_weight]; spatial variants store
-only [spatial_weight] while preserving the exact same topology.
+The baseline stores [spatial_weight, semantic_weight].  The distance-only
+variant stores the same coordinate-derived topology without ``edge_attr``.
 """
 
 import numpy as np
@@ -15,8 +15,8 @@ except ImportError:  # Small tests may use the exact torch fallback.
     NearestNeighbors = None
 
 
-GRAPH_FORMAT_VERSION = 2
-EDGE_MODE_DIMS = {"dual": 2, "spatial": 1}
+GRAPH_FORMAT_VERSION = 3
+EDGE_MODE_DIMS = {"dual": 2, "distance": 0}
 
 
 def _knn(coords, k, chunk_size=1024):
@@ -94,11 +94,14 @@ def build_graph(
         raise ValueError(
             f"Unsupported edge_mode={edge_mode!r}; expected one of {sorted(EDGE_MODE_DIMS)}"
         )
-    edge_dim = EDGE_MODE_DIMS[edge_mode]
     if len(coords) < 2:
         return (
             np.empty((0, 2), dtype=np.int64),
-            np.empty((0, edge_dim), dtype=np.float32),
+            (
+                np.empty((0, EDGE_MODE_DIMS[edge_mode]), dtype=np.float32)
+                if edge_mode == "dual"
+                else None
+            ),
         )
 
     k_actual = min(int(k), len(coords) - 1)
@@ -120,19 +123,21 @@ def build_graph(
         for target, distance in zip(indices[source], distances[source]):
             if distance > max_distance:
                 continue
-            spatial_weight = np.exp(-(distance ** 2) / (2.0 * sigma_d ** 2))
             edges.append((source, int(target)))
             if edge_mode == "dual":
+                spatial_weight = np.exp(-(distance ** 2) / (2.0 * sigma_d ** 2))
                 semantic_weight = (
                     float(np.dot(normalized_features[source], normalized_features[target]))
                     + 1.0
                 ) / 2.0
                 attributes.append((spatial_weight, semantic_weight))
-            else:
-                attributes.append((spatial_weight,))
     return (
         np.asarray(edges, dtype=np.int64).reshape(-1, 2),
-        np.asarray(attributes, dtype=np.float32).reshape(-1, edge_dim),
+        (
+            np.asarray(attributes, dtype=np.float32).reshape(-1, 2)
+            if edge_mode == "dual"
+            else None
+        ),
     )
 
 
@@ -158,7 +163,11 @@ def to_pyg_data(
     data = Data(
         x=torch.as_tensor(features, dtype=torch.float32),
         edge_index=torch.as_tensor(edges.T, dtype=torch.long),
-        edge_attr=torch.as_tensor(edge_attr, dtype=torch.float32),
+        edge_attr=(
+            torch.as_tensor(edge_attr, dtype=torch.float32)
+            if edge_attr is not None
+            else None
+        ),
         pos=torch.as_tensor(coords, dtype=torch.float32),
         y=torch.as_tensor(labels, dtype=torch.long) if labels is not None else None,
     )
@@ -193,11 +202,17 @@ def validate_graph_schema(
     count = data.x.size(0)
     if data.edge_index is None or data.edge_index.shape[0] != 2:
         raise ValueError("graph.edge_index must be [2,E]")
-    if data.edge_attr is None or data.edge_attr.ndim not in (1, 2):
-        raise ValueError("graph.edge_attr must be [E] or [E,D]")
-    actual_edge_dim = 1 if data.edge_attr.ndim == 1 else data.edge_attr.size(1)
-    if data.edge_attr.size(0) != data.edge_index.size(1):
-        raise ValueError("graph.edge_attr and graph.edge_index contain different edge counts")
+    edge_attr = getattr(data, "edge_attr", None)
+    if edge_attr is None:
+        actual_edge_dim = 0
+    else:
+        if edge_attr.ndim not in (1, 2):
+            raise ValueError("graph.edge_attr must be [E] or [E,D]")
+        actual_edge_dim = 1 if edge_attr.ndim == 1 else edge_attr.size(1)
+        if edge_attr.size(0) != data.edge_index.size(1):
+            raise ValueError(
+                "graph.edge_attr and graph.edge_index contain different edge counts"
+            )
     if actual_edge_dim not in EDGE_MODE_DIMS.values():
         raise ValueError(f"Unsupported graph edge dimension: {actual_edge_dim}")
     if expected_edge_dim is not None and actual_edge_dim != int(expected_edge_dim):

@@ -65,17 +65,47 @@ def get_sha():
 
 
 class CosineScheduler(object):
-    def __init__(self, base_value, final_value, total_iters, warmup_iters=0, start_warmup_value=0, freeze_iters=0):
+    def __init__(
+        self,
+        base_value,
+        final_value,
+        total_iters,
+        warmup_iters=0,
+        start_warmup_value=0,
+        freeze_iters=0,
+        cycle_iters=0,
+    ):
         super().__init__()
         self.final_value = final_value
         self.total_iters = total_iters
+
+        if cycle_iters < 0:
+            raise ValueError("cycle_iters must be non-negative")
+        if warmup_iters + freeze_iters > total_iters:
+            raise ValueError("warmup_iters + freeze_iters exceeds total_iters")
 
         freeze_schedule = np.zeros((freeze_iters))
 
         warmup_schedule = np.linspace(start_warmup_value, base_value, warmup_iters)
 
-        iters = np.arange(total_iters - warmup_iters - freeze_iters)
-        schedule = final_value + 0.5 * (base_value - final_value) * (1 + np.cos(np.pi * iters / len(iters)))
+        schedule_length = total_iters - warmup_iters - freeze_iters
+        if cycle_iters:
+            # Align restart boundaries to global training iterations. Warmup
+            # replaces the beginning of the first cycle without shifting the
+            # requested cycle boundaries.
+            global_iters = np.arange(
+                warmup_iters + freeze_iters,
+                total_iters,
+            )
+            phase = np.remainder(global_iters, cycle_iters) / cycle_iters
+            schedule = final_value + 0.5 * (base_value - final_value) * (
+                1 + np.cos(np.pi * phase)
+            )
+        else:
+            iters = np.arange(schedule_length)
+            schedule = final_value + 0.5 * (base_value - final_value) * (
+                1 + np.cos(np.pi * iters / len(iters))
+            )
         self.schedule = np.concatenate((freeze_schedule, warmup_schedule, schedule))
 
         assert len(self.schedule) == self.total_iters

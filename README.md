@@ -46,6 +46,10 @@ CerviPath 是宫颈病理图像的 DINOv2–GNN 预训练与分割项目。仓�
 cd dinov2_stage1_Extract2s2
 DINO_WEIGHTS=/absolute/path/to/dino_checkpoint.pth bash pretrain.sh
 
+# 独立长周期版本：800 epochs，200-epoch cosine restart，min_lr=1e-8
+# 默认使用 GPU 1，旧的 100-epoch 权重和结果目录不会被覆盖
+bash pretrain_stage1a_cosine200_e800.sh
+
 # Stage-1B：导出图节点和分割 dense tokens
 STAGE1_WEIGHTS=/absolute/path/to/merged_stage1_checkpoint.pth \
   bash pretrain_imgnet22k.sh
@@ -71,7 +75,7 @@ PYTHON_BIN=/path/to/python-with-pyg
 GRAPH_ROOT=../Graph/graphs-current \
   PYTHON_BIN="$PYTHON_BIN" bash pretrain.sh
 
-# Stage 2 多版本对比（baseline / spatial_only / spatial_bias）
+# Stage 2 三版本对比（原版 / 全程纯距离无边权 / 原版预训练后纯距离无边权）
 # 详细说明见 experiments/stage2_variants/README.md
 EMBEDDINGS_DIR=../Graph/embeddings-current \
   METADATA_DIR=../Graph/embeddings-current \
@@ -80,12 +84,12 @@ EMBEDDINGS_DIR=../Graph/embeddings-current \
 EMBEDDINGS_DIR=../Graph/embeddings-current \
   METADATA_DIR=../Graph/embeddings-current \
   PYTHON_BIN="$PYTHON_BIN" \
-  bash experiments/stage2_variants/prepare_graphs.sh spatial_only
+  bash experiments/stage2_variants/prepare_graphs.sh distance_only
 
 # 两张空闲 GPU 上同时启动两个独立 Stage 2 版本
 PYTHON_BIN="$PYTHON_BIN" \
   bash experiments/stage2_variants/run_parallel.sh \
-  comparison_01 baseline spatial_only
+  comparison_01 baseline distance_only
 
 # 用合并后的 Stage-2 权重对完整 WSI 图导出节点 context
 "$PYTHON_BIN" export_context.py \

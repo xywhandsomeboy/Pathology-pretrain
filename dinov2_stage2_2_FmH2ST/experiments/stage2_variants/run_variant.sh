@@ -10,7 +10,7 @@ gpu_id="${2:-}"
 run_id="${3:-manual}"
 
 if [[ ! "${variant}" =~ ^[a-z0-9_]+$ || ! "${gpu_id}" =~ ^[0-9]+$ ]]; then
-  echo "Usage: $0 {baseline|spatial_only|spatial_bias} GPU_ID [RUN_ID]" >&2
+  echo "Usage: $0 {baseline|distance_only|weighted_pretrain_distance_context} GPU_ID [RUN_ID]" >&2
   exit 2
 fi
 if [[ ! "${run_id}" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -27,7 +27,8 @@ source "${definition}"
 
 python_bin="${PYTHON_BIN:-${workspace_dir}/dinov2/.venv/bin/python}"
 config_file="${CONFIG_FILE:-${stage2_dir}/dinov2/configs/train/vitl16_short.yaml}"
-graph_root="${GRAPH_ROOT:-${workspace_dir}/Graph/stage2_variants/${GRAPH_SET}}"
+graph_root="${PRETRAIN_GRAPH_ROOT:-${workspace_dir}/Graph/stage2_variants/${PRETRAIN_GRAPH_SET}}"
+context_graph_root="${CONTEXT_GRAPH_ROOT:-${workspace_dir}/Graph/stage2_variants/${CONTEXT_GRAPH_SET}}"
 output_dir="${OUTPUT_DIR:-${stage2_dir}/dinov2/results/stage2_variants/${VARIANT_NAME}/${run_id}}"
 num_workers="${NUM_WORKERS:-4}"
 max_nodes="${MAX_NODES:-5000}"
@@ -48,9 +49,17 @@ if [[ ! -f "${graph_manifest}" ]]; then
   echo "Missing graph manifest: ${graph_manifest}" >&2
   exit 1
 fi
-manifest_edge_mode="$("${python_bin}" -c 'import json,sys; print(json.load(open(sys.argv[1]))["edge_mode"])' "${graph_manifest}")"
-if [[ "${manifest_edge_mode}" != "${EDGE_MODE}" ]]; then
-  echo "Graph edge mode ${manifest_edge_mode} does not match variant mode ${EDGE_MODE}." >&2
+read -r manifest_edge_mode manifest_edge_dim < <(
+  "${python_bin}" -c \
+    'import json,sys; value=json.load(open(sys.argv[1])); print(value["edge_mode"], value["edge_dim"])' \
+    "${graph_manifest}"
+)
+if [[ "${manifest_edge_mode}" != "${PRETRAIN_EDGE_MODE}" ]]; then
+  echo "Graph edge mode ${manifest_edge_mode} does not match variant mode ${PRETRAIN_EDGE_MODE}." >&2
+  exit 1
+fi
+if [[ "${manifest_edge_dim}" != "${PRETRAIN_EDGE_DIM}" ]]; then
+  echo "Graph edge_dim ${manifest_edge_dim} does not match variant edge_dim ${PRETRAIN_EDGE_DIM}." >&2
   exit 1
 fi
 if ! "${python_bin}" -c "import torch_geometric, torch_scatter" >/dev/null 2>&1; then
@@ -91,10 +100,15 @@ source_hashes="$(
   printf 'gpu_id=%s\n' "${gpu_id}"
   printf 'graph_root=%s\n' "${graph_root}"
   printf 'graph_manifest=%s\n' "${graph_manifest}"
-  printf 'edge_mode=%s\n' "${EDGE_MODE}"
-  printf 'edge_dim=%s\n' "${EDGE_DIM}"
-  printf 'edge_injection=%s\n' "${EDGE_INJECTION}"
-  printf 'spatial_bias_init=%s\n' "${SPATIAL_BIAS_INIT}"
+  printf 'pretrain_edge_mode=%s\n' "${PRETRAIN_EDGE_MODE}"
+  printf 'pretrain_edge_dim=%s\n' "${PRETRAIN_EDGE_DIM}"
+  printf 'pretrain_edge_injection=%s\n' "${PRETRAIN_EDGE_INJECTION}"
+  printf 'edge_weight_objective=%s\n' "${EDGE_WEIGHT_OBJECTIVE}"
+  printf 'edge_weight_weight=%s\n' "${EDGE_WEIGHT_WEIGHT}"
+  printf 'edge_weight_noise_std=%s\n' "${EDGE_WEIGHT_NOISE_STD}"
+  printf 'context_graph_root=%s\n' "${context_graph_root}"
+  printf 'context_edge_mode=%s\n' "${CONTEXT_EDGE_MODE}"
+  printf 'context_use_edge_attr=%s\n' "${CONTEXT_USE_EDGE_ATTR}"
   printf 'seed=%s\n' "${run_seed}"
   printf 'max_nodes=%s\n' "${max_nodes}"
   printf 'source_sha256:\n%s\n' "${source_hashes}"
@@ -106,9 +120,13 @@ exec "${python_bin}" -m dinov2.train.train \
   --no-resume \
   --config-file "${config_file}" \
   --output-dir "${output_dir}" \
-  "gcn.edge_dim=${EDGE_DIM}" \
-  "gcn.edge_injection=${EDGE_INJECTION}" \
-  "gcn.spatial_bias_init=${SPATIAL_BIAS_INIT}" \
+  "gcn.edge_dim=${PRETRAIN_EDGE_DIM}" \
+  "gcn.edge_injection=${PRETRAIN_EDGE_INJECTION}" \
+  "gcn.edge_weight_objective=${EDGE_WEIGHT_OBJECTIVE}" \
+  "gcn.edge_weight_weight=${EDGE_WEIGHT_WEIGHT}" \
+  "gcn.edge_weight_noise_std=${EDGE_WEIGHT_NOISE_STD}" \
+  "gcn.context_edge_mode=${CONTEXT_EDGE_MODE}" \
+  "gcn.context_use_edge_attr=${CONTEXT_USE_EDGE_ATTR}" \
   "train.seed=${run_seed}" \
   "train.num_workers=${num_workers}" \
-  "train.dataset_path=ImageFolder:root=${graph_root}:max_nodes=${max_nodes}:edge_dim=${EDGE_DIM}"
+  "train.dataset_path=ImageFolder:root=${graph_root}:max_nodes=${max_nodes}:edge_dim=${PRETRAIN_EDGE_DIM}"

@@ -68,12 +68,14 @@ def build_optimizer(cfg, params_groups):
 
 def build_schedulers(cfg):
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
+    cosine_cycle_epochs = int(getattr(cfg.optim, "cosine_cycle_epochs", 0))
     lr = dict(
         base_value=cfg.optim["lr"],
         final_value=cfg.optim["min_lr"],
         total_iters=cfg.optim["epochs"] * OFFICIAL_EPOCH_LENGTH,
         warmup_iters=cfg.optim["warmup_epochs"] * OFFICIAL_EPOCH_LENGTH,
         start_warmup_value=0,
+        cycle_iters=cosine_cycle_epochs * OFFICIAL_EPOCH_LENGTH,
     )
     wd = dict(
         base_value=cfg.optim["weight_decay"],
