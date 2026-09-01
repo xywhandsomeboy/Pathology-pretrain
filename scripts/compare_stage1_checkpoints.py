@@ -47,24 +47,44 @@ def _load_metrics(path: Path) -> tuple[list[dict[str, float]], dict[str, int]]:
             records.append(record)
     if not records:
         raise ValueError(f"No metric records in {path}")
-    # A no-resume relaunch may append a fresh iteration-0 segment to an
-    # existing metrics file. Only the final monotonic segment can correspond
-    # to model_final; mixing the abandoned prefix would bias the comparison.
-    restart_indices = [
-        index
-        for index in range(1, len(records))
-        if int(records[index]["iteration"]) <= int(records[index - 1]["iteration"])
-    ]
-    segment_start = restart_indices[-1] if restart_indices else 0
-    selected = records[segment_start:]
+    # A fresh no-resume run restarts at iteration 0, so its abandoned prefix
+    # must be discarded. A real checkpoint resume restarts at a positive
+    # iteration; retain the earlier history but replace the overlapping tail
+    # after the checkpoint. This reconstructs one canonical metric record per
+    # iteration across any number of interrupted resumes.
+    selected = []
+    restart_boundaries = 0
+    fresh_restart_boundaries = 0
+    resume_boundaries = 0
+    discarded_records = 0
+    for record in records:
+        iteration = int(record["iteration"])
+        if selected and iteration <= int(selected[-1]["iteration"]):
+            restart_boundaries += 1
+            if iteration == 0:
+                fresh_restart_boundaries += 1
+                discarded_records += len(selected)
+                selected = []
+            else:
+                resume_boundaries += 1
+                retained = [
+                    previous
+                    for previous in selected
+                    if int(previous["iteration"]) < iteration
+                ]
+                discarded_records += len(selected) - len(retained)
+                selected = retained
+        selected.append(record)
     iterations = [int(record["iteration"]) for record in selected]
     if iterations != sorted(iterations) or len(iterations) != len(set(iterations)):
         raise ValueError(f"Final metric segment is not strictly increasing in {path}")
     provenance = {
         "raw_records": len(records),
         "selected_records": len(selected),
-        "discarded_prefix_records": segment_start,
-        "restart_boundaries": len(restart_indices),
+        "discarded_records": discarded_records,
+        "restart_boundaries": restart_boundaries,
+        "fresh_restart_boundaries": fresh_restart_boundaries,
+        "resume_boundaries": resume_boundaries,
     }
     return selected, provenance
 
@@ -206,11 +226,11 @@ def main() -> int:
             f"total_loss={total['mean']:.8f}±{total['std']:.8f}, "
             f"records={candidate['window_records']}"
         )
-        discarded = candidate["metrics_log"]["discarded_prefix_records"]
+        discarded = candidate["metrics_log"]["discarded_records"]
         if discarded:
             print(
-                f"   selected final monotonic log segment; "
-                f"discarded {discarded} prefix records"
+                f"   reconstructed canonical resumed log; "
+                f"discarded {discarded} superseded records"
             )
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
