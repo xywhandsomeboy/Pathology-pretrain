@@ -25,9 +25,9 @@ DINO 初始化权重。
 长周期实验会另外保留 `budget_checkpoints/model_0009999.rank_0.pth`，用于和旧版在
 完全相同的 10,000-step 预算下做诊断；200-epoch 周期端点保存在
 `cycle_checkpoints/`。最终选择仍由 `scripts/compare_stage1_checkpoints.py` 在所有完整
-候选的相同 trailing window 上统一完成。工具若发现日志由 no-resume 重启追加而成，
-只选择与最终 checkpoint 对应的最后一个严格单调片段，并在 JSON 中记录被丢弃的前缀
-数量，禁止把两次运行的指标混合统计。
+候选的相同 trailing window 上统一完成。工具会区分从 iteration 0 开始的全新重跑和
+从正数 iteration 开始的 checkpoint 续训：前者丢弃旧运行，后者保留 checkpoint 前
+的历史并用续训记录替换重叠尾部，从而为每个 iteration 只保留一条规范记录。
 
 ## 2. Stage-1B：确定性导出
 

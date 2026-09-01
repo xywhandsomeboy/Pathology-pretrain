@@ -50,6 +50,10 @@ DINO_WEIGHTS=/absolute/path/to/dino_checkpoint.pth bash pretrain.sh
 # 默认使用 GPU 1，旧的 100-epoch 权重和结果目录不会被覆盖
 bash pretrain_stage1a_cosine200_e800.sh
 
+# 独立超长周期版本：1200 epochs，400-epoch cosine restart，
+# 实际 max_lr=1e-2、min_lr=1e-8；不会覆盖前述实验
+bash pretrain_stage1a_cosine400_e1200_maxlr1e-2.sh
+
 # Stage-1B：导出图节点和分割 dense tokens
 STAGE1_WEIGHTS=/absolute/path/to/merged_stage1_checkpoint.pth \
   bash pretrain_imgnet22k.sh
