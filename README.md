@@ -58,6 +58,11 @@ bash pretrain_stage1a_cosine400_e1200_maxlr1e-2.sh
 STAGE1_WEIGHTS=/absolute/path/to/merged_stage1_checkpoint.pth \
   bash pretrain_imgnet22k.sh
 
+# 等待获选 Stage-1B 全量导出，随后整理特征、建两套图并在资源安全时
+# 启动 baseline/distance_only Stage-2 对比训练
+cd ..
+bash scripts/run_stage2_after_stage1b.sh
+
 # 从完整 ImageNet22k 身份索引和只读参考坐标重建 2,299,631 个训练 patch 的元数据。
 # 参考目录只提供坐标/节点顺序；其中的旧特征不会复制进新结果。
 cd ..
