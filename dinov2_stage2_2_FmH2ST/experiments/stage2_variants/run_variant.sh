@@ -103,6 +103,8 @@ source_hashes="$(
   printf 'pretrain_edge_mode=%s\n' "${PRETRAIN_EDGE_MODE}"
   printf 'pretrain_edge_dim=%s\n' "${PRETRAIN_EDGE_DIM}"
   printf 'pretrain_edge_injection=%s\n' "${PRETRAIN_EDGE_INJECTION}"
+  printf 'edge_existence_objective=%s\n' "${EDGE_EXISTENCE_OBJECTIVE}"
+  printf 'edge_existence_weight=%s\n' "${EDGE_EXISTENCE_WEIGHT}"
   printf 'edge_weight_objective=%s\n' "${EDGE_WEIGHT_OBJECTIVE}"
   printf 'edge_weight_weight=%s\n' "${EDGE_WEIGHT_WEIGHT}"
   printf 'edge_weight_noise_std=%s\n' "${EDGE_WEIGHT_NOISE_STD}"
@@ -122,6 +124,8 @@ exec "${python_bin}" -m dinov2.train.train \
   --output-dir "${output_dir}" \
   "gcn.edge_dim=${PRETRAIN_EDGE_DIM}" \
   "gcn.edge_injection=${PRETRAIN_EDGE_INJECTION}" \
+  "gcn.edge_existence_objective=${EDGE_EXISTENCE_OBJECTIVE}" \
+  "gcn.edge_existence_weight=${EDGE_EXISTENCE_WEIGHT}" \
   "gcn.edge_weight_objective=${EDGE_WEIGHT_OBJECTIVE}" \
   "gcn.edge_weight_weight=${EDGE_WEIGHT_WEIGHT}" \
   "gcn.edge_weight_noise_std=${EDGE_WEIGHT_NOISE_STD}" \

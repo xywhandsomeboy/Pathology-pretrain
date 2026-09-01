@@ -82,6 +82,7 @@ gcn:
   # Edge existence uses masked positives and reliable non-edge negatives.
   edge_mask_ratio: 0.3
   negatives_per_positive: 2
+  edge_existence_objective: true
   edge_existence_weight: 1.0
   edge_weight_objective: true
   edge_weight_weight: 0.1

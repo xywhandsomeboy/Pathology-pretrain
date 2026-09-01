@@ -36,15 +36,29 @@ class GCNMetaArch(nn.Module):
         self.edge_weight_objective = bool(
             getattr(cfg.gcn, "edge_weight_objective", True)
         )
+        self.edge_existence_objective = bool(
+            getattr(cfg.gcn, "edge_existence_objective", True)
+        )
         if self.edge_weight_objective and int(cfg.gcn.edge_dim) <= 0:
             raise ValueError("The edge-weight objective requires edge_dim > 0")
+        if (
+            not self.edge_existence_objective
+            and float(cfg.gcn.edge_existence_weight) != 0.0
+        ):
+            raise ValueError(
+                "edge_existence_weight must be zero when the edge-existence "
+                "objective is disabled"
+            )
         student_modules = {
             "gcn": gcn,
             "mask_token": LearnableMaskToken(dim),
             "node_decoder": nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, dim)),
             "projection": nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.Linear(dim, cfg.gcn.contrast_proj_dim)),
-            "edge_existence_head": nn.Sequential(nn.Linear(pair_dim, dim), nn.GELU(), nn.Linear(dim, 1)),
         }
+        if self.edge_existence_objective:
+            student_modules["edge_existence_head"] = nn.Sequential(
+                nn.Linear(pair_dim, dim), nn.GELU(), nn.Linear(dim, 1)
+            )
         if self.edge_weight_objective:
             student_modules["edge_weight_head"] = nn.Sequential(
                 nn.Linear(pair_dim, dim),
@@ -271,7 +285,12 @@ class GCNMetaArch(nn.Module):
 
     def _edge_losses(self, graph, pairs, negatives):
         zero = graph.x.sum() * 0.0
-        if not pairs.numel():
+        if (
+            not pairs.numel()
+            or not (
+                self.edge_existence_objective or self.edge_weight_objective
+            )
+        ):
             return zero, zero
         count = min(pairs.size(0), max(1, round(pairs.size(0) * self.cfg.gcn.edge_mask_ratio)))
         positive = pairs[torch.randperm(pairs.size(0), device=graph.x.device)[:count]]
@@ -283,17 +302,31 @@ class GCNMetaArch(nn.Module):
             graph.edge_attr[keep] if graph.edge_attr is not None else None
         )
         h = self.student.gcn(graph.x, graph.edge_index[:, keep], kept_edge_attr)
-        candidates = torch.triu(negatives, diagonal=1).nonzero()
-        if candidates.numel():
-            candidates = candidates[torch.randperm(candidates.size(0), device=graph.x.device)]
-        negative = candidates[:min(candidates.size(0), count * self.cfg.gcn.negatives_per_positive)]
-        if negative.numel():
-            all_pairs = torch.cat((positive, negative))
-            labels = torch.cat((torch.ones(count, device=h.device), torch.zeros(negative.size(0), device=h.device)))
-            logits = self.student.edge_existence_head(self._pair_features(h, all_pairs)).squeeze(-1)
-            existence = F.binary_cross_entropy_with_logits(logits, labels)
-        else:
-            existence = zero
+        existence = zero
+        if self.edge_existence_objective:
+            candidates = torch.triu(negatives, diagonal=1).nonzero()
+            if candidates.numel():
+                candidates = candidates[
+                    torch.randperm(candidates.size(0), device=graph.x.device)
+                ]
+            negative = candidates[
+                : min(
+                    candidates.size(0),
+                    count * self.cfg.gcn.negatives_per_positive,
+                )
+            ]
+            if negative.numel():
+                all_pairs = torch.cat((positive, negative))
+                labels = torch.cat(
+                    (
+                        torch.ones(count, device=h.device),
+                        torch.zeros(negative.size(0), device=h.device),
+                    )
+                )
+                logits = self.student.edge_existence_head(
+                    self._pair_features(h, all_pairs)
+                ).squeeze(-1)
+                existence = F.binary_cross_entropy_with_logits(logits, labels)
         if not self.edge_weight_objective:
             return existence, zero
         targets = []
