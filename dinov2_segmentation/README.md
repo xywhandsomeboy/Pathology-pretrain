@@ -1,6 +1,8 @@
 # DINO–GNN 全局语义 + 高分辨率局部分割
 
-这个目录实现了已经确认的双分支方案，并与 Stage1/Stage2 预训练解耦。分割训练不会再次逐 patch 运行整张 WSI 的图网络；它读取事先按坐标严格对齐的缓存。
+这个目录实现已经确认的双分支方案。Stage1/Stage2 的预训练彼此独立，但最终分割训练使用
+`train_joint.py` 联合微调 Stage1、Stage2 GATv2 和 Decoder；离线 Stage1B 结果只用于建立
+图拓扑及初始化邻居特征记忆，不能代替最终训练中的在线前向。
 
 ## 最终网络
 
@@ -14,47 +16,20 @@
 
 ## 数据流
 
-1. Stage1 对每个 WSI patch 输出两份内容：用于建图的 `node_features` 和未池化的 `dense_tokens`。配置 `feature.export_dense_tokens: true` 后，Stage1B 会额外写出 `decoder_features_s1_part*.pt`。
-2. 使用同一个有序 patch 列表建整张 WSI 图。图中只写入轻量的 `patch_ids`、
-   `levels` 和 `slide_id`；`dense_tokens` 单独保存在 Stage1 per-slide 文件中，避免
-   Stage2 每次加载图时同时读取数 GB 的 decoder 特征。
-3. 加载训练好的 Stage2，先执行 `model.eval()`，再对完整图调用 `model.extract_context(graph)`；不能使用数据集里的随机 5000 节点子图。保存示例：
+1. Stage1B 对全部 WSI patch 生成初始 `node_features`，随后仅依据固定坐标建立 dual 或
+   distance 图；图保留 `patch_ids`、坐标、level 和初始节点特征。
+2. 最终监督 batch 从原图重新执行可训练 Stage1，在线产生 DINO dense tokens 以及融合
+   CLS/global/local crop 的节点特征。
+3. 当前目标节点的在线特征替换图记忆中的对应节点。对目标节点提取 5-hop 子图，恰好覆盖
+   5 层 GATv2 的完整感受野；Stage2 输出在线 context，梯度继续回传到 Stage1。
+4. 每个已见节点的在线特征以 detached 形式刷新邻居记忆，避免每次把整张 WSI 的全部原图
+   同时放入显存；当前目标节点的计算图不会 detach。
+5. Decoder 同时接收原图、在线 dense tokens 和在线 GATv2 context。分割损失一次反向传播
+   更新 Stage1、Stage2 与 V1/V2。
 
-   ```python
-   model.eval()
-   context = model.extract_context(graph).cpu()
-   torch.save({
-       "patch_ids": graph.patch_ids,
-       "global_context": context,
-   }, "slide_context.pt")
-   ```
-
-4. 合并成分割用的单 WSI 缓存：
-
-   ```bash
-   /path/to/python -m dinov2_segmentation.prepare_slide_store \
-     --graph graph/TCGA-example.pt \
-     --context context/TCGA-example.pt \
-     --stage1-metadata embeddings/TCGA-example_metadata.pt \
-     --dense-tokens embeddings/TCGA-example_dense_tokens.npy \
-     --output features/TCGA-example.pt
-   ```
-
-   `context` 文件默认必须携带与 graph 完全同序的 `patch_ids`。旧的裸 tensor 只有在
-   人工核验顺序后才能使用 `--allow-unkeyed-context`，避免历史文件静默错位。
-
-5. 准备 CSV manifest。格式见 `example_manifest.csv`。每一行必须包含：
-
-   - `slide_id, patch_id, x, y, level`
-   - `image_path, feature_path`
-   - 训练时还需 `mask_path`
-   - `feature_index` 可省略；省略后按 `patch_id` 查找
-
-读取样本时会同时比较 `slide_id + level + x + y + patch_id`。图节点排序、坐标或图像错一项都会报错，防止模型在错误 patch 之间进行融合。
-
-feature store 当前格式为 v2：较小的 metadata/context 保存在 `.pt`，体积最大的 DINO
-dense tokens 自动写到同目录 `.dense_tokens.npy`，训练 worker 通过 memory map 只读取
-当前 patch。旧 v1 单文件 store 仍可读取。
+联合训练 manifest 直接使用数据准备阶段的 CSV，必须包含
+`slide_id, patch_id, x, y, level, image_path, mask_path`。mask 严格限制为 `{0,1}`：正常/背景
+为 0，Low Grade、High Grade 与 Malignant 均为肿瘤 1。
 
 已有 `patch_grid_positions*.csv` 时可以转换 manifest：
 
@@ -69,19 +44,35 @@ dense tokens 自动写到同目录 `.dense_tokens.npy`，训练 worker 通过 me
 
 ## 训练
 
-从 `CerviPath` 目录运行：
+从 Stage2 目录运行，并把 Stage2 源码与仓库根目录加入 `PYTHONPATH`：
 
 ```bash
-/path/to/python -m dinov2_segmentation.train \
-  --train-manifest manifests/train.csv \
-  --val-manifest manifests/val.csv \
-  --output-dir outputs/segmentation \
-  --num-classes 4 \
-  --image-size 224 \
-  --batch-size 8
+PYTHONPATH=/path/to/CerviPath/dinov2_stage2_2_FmH2ST:/path/to/CerviPath \
+/path/to/python -m dinov2_segmentation.train_joint \
+  --decoder-version v1 \
+  --train-manifest decoder_selection/train.csv \
+  --val-manifest decoder_selection/valid.csv \
+  --graph-dir graphs/dual \
+  --stage1-config stage1/config.yaml \
+  --stage1-checkpoint stage1/model.pth \
+  --stage2-config stage2/config.yaml \
+  --stage2-checkpoint stage2/model_final.rank_0.pth \
+  --output-dir outputs/baseline/v1 \
+  --num-classes 2 --epochs 50 --batch-size 1 \
+  --gradient-accumulation 8
 ```
 
-第一阶段只训练本目录的高分辨率分支和 Decoder。DINO 与 GNN 已经离线生成缓存，因此天然冻结。默认损失为 Cross Entropy + soft Dice，mask 必须是单通道类别索引图；`255` 为 ignore index。RGB 颜色 mask 需要先显式转换为类别编号，数据集不会猜测颜色含义。
+默认优化依据相关论文采用 AdamW、5% 线性 warm-up 和单周期 cosine decay。默认峰值学习率为：
+Decoder `2e-4`、Stage2 GATv2 `5e-5`、Stage1 聚合/融合层 `5e-5`、Stage1 ViT 顶层
+`2e-5`；24 个 ViT block 从输出到输入按 `0.9` 逐层衰减。bias、归一化参数和 token/位置
+参数不做 weight decay。首个监督更新必须产生非零 Stage1、Stage2、Decoder 梯度，否则立即
+停止，并把审计结果写入 `gradient_audit.json`。
+
+默认损失为 Cross Entropy + soft Dice，`255` 为 ignore index。模型选择依据验证集肿瘤 Dice，
+同时记录 tumor IoU、pixel accuracy 和完整混淆矩阵。
+
+完整的论文依据、参数选择和工程取舍见
+[`JOINT_TRAINING_STRATEGY.md`](JOINT_TRAINING_STRATEGY.md)。
 
 ## WSI 推理与拼接
 
@@ -98,9 +89,10 @@ dense tokens 自动写到同目录 `.dense_tokens.npy`，训练 worker 通过 me
 
 ## 关键约束
 
-- `dense_tokens` 必须来自未做空间平均的 DINO patch tokens，不包含 CLS token。
+- `dense_tokens` 必须由当前可训练 Stage1 在线产生，来自未做空间平均的 DINO patch tokens，
+  不包含 CLS token。
 - CLS token 已在 Stage1 的 node fusion 中与 global/local spatial feature 融合，再经 Stage2 进入 `global_context`，因此没有从最终分支一中丢失。
-- `global_context[i]` 必须由包含节点 `i` 的完整 WSI 图产生，并与 graph node order 一致。
+- `global_context[i]` 必须由包含节点 `i` 的精确 5-hop 感受野产生，并与 graph node order 一致。
 - 原图 patch、mask、dense token 和 GNN context 必须共享相同裁切坐标和 level。
-- 训练时几何翻转会同步作用于原图、mask 和 DINO token 网格；GNN context 是向量，不需要翻转。
+- 训练时几何翻转先同步作用于原图和 mask；DINO token 由翻转后的原图在线生成。
 - 当前代码只实现单一 H/4 高分辨率流，没有采用 FmH2ST 的双图层级结构，因此不会改变既定图预训练代理任务。

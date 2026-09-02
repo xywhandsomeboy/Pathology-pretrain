@@ -20,14 +20,16 @@ stage1_batch="${STAGE1_BATCH_SIZE:-64}"
 stage1_workers="${STAGE1_WORKERS:-8}"
 decoder_epochs="${DECODER_EPOCHS:-50}"
 decoder_workers="${DECODER_WORKERS:-4}"
-v1_batch="${V1_BATCH_SIZE:-8}"
-v2_batch="${V2_BATCH_SIZE:-4}"
+v1_batch="${V1_BATCH_SIZE:-1}"
+v2_batch="${V2_BATCH_SIZE:-1}"
+joint_accumulation="${JOINT_GRADIENT_ACCUMULATION:-8}"
 
 stage1_dir="${repo_dir}/dinov2_stage1_Extract2s2"
 stage2_dir="${repo_dir}/dinov2_stage2_2_FmH2ST"
 stage2_experiments="${stage2_dir}/experiments/stage2_variants"
 stage2_results="${stage2_dir}/dinov2/results/stage2_variants"
 selected_stage1_checkpoint="${STAGE1_CHECKPOINT:-${stage1_dir}/dinov2/results/stage1a_spatial_fusion_cosine200_e800_minlr1e-8/cycle_checkpoints/model_0039999.rank_0.pth}"
+selected_stage1_config="${STAGE1_CONFIG:-${stage1_dir}/dinov2/results/stage1a_spatial_fusion_cosine200_e800_minlr1e-8/config.yaml}"
 logs_dir="${work_root}/logs"
 status_log="${logs_dir}/pipeline.log"
 
@@ -92,7 +94,7 @@ status_args=(
   --minimum-valid "${minimum_valid}"
 )
 
-for required in "${python_bin}" "${download_manifest}" "${metadata_xlsx}" "${selected_stage1_checkpoint}"; do
+for required in "${python_bin}" "${download_manifest}" "${metadata_xlsx}" "${selected_stage1_checkpoint}" "${selected_stage1_config}"; do
   [[ -e "${required}" ]] || fail "Missing required resource: ${required}"
 done
 for command in flock nvidia-smi; do
@@ -164,7 +166,7 @@ if [[ ! -f "${stage1_output}/complete" ]]; then
       --config-file dinov2/configs/train/vitl16_short_imgnet22k.yaml \
       --output-dir "${stage1_output}" \
       "MODEL.WEIGHTS=${selected_stage1_checkpoint}" \
-      "feature.export_dense_tokens=true" \
+      "feature.export_dense_tokens=false" \
       "feature.require_trained_spatial=true" \
       "train.batch_size_per_gpu=${stage1_batch}" \
       "train.num_workers=${stage1_workers}" \
@@ -174,7 +176,6 @@ if [[ ! -f "${stage1_output}/complete" ]]; then
     --embeddings-dir "${stage1_embeddings}" \
     --patch-csv "${work_root}/all_patches.csv" \
     --output-dir "${stage1_organized}" \
-    --require-dense-tokens \
     2>&1 | tee -a "${logs_dir}/organize_stage1.log"
   touch "${stage1_output}/complete"
 fi
@@ -197,55 +198,12 @@ graph_distance="${work_root}/graphs/distance"
     --edge-mode distance --k 8 --distance-multiplier 3.0 \
     --require-decoder-metadata
 ) 2>&1 | tee -a "${logs_dir}/build_graphs.log"
-log "Cervical dual-edge and distance-only graphs complete"
-
-export_variant_context() {
-  local variant="$1"
-  local graph_dir="$2"
-  local run_dir="${stage2_results}/${variant}/${stage2_run_id}"
-  local context_dir="${work_root}/contexts/${variant}"
-  wait_for_gpu 0
-  log "Exporting full-WSI context: ${variant}"
-  (
-    cd "${stage2_dir}"
-    export CUDA_VISIBLE_DEVICES=0
-    "${python_bin}" export_context.py \
-      --config-file "${run_dir}/config.yaml" \
-      --checkpoint "${run_dir}/model_final.rank_0.pth" \
-      --graph-dir "${graph_dir}" \
-      --output-dir "${context_dir}" \
-      --device cuda
-  ) > "${logs_dir}/context_${variant}.log" 2>&1
-}
-
-export_variant_context baseline "${graph_dual}"
-export_variant_context distance_only "${graph_distance}"
-export_variant_context weighted_pretrain_distance_context "${graph_distance}"
-
-prepare_variant() {
-  local variant="$1"
-  local graph_dir="$2"
-  local store_dir="${work_root}/feature_stores/${variant}"
-  local manifest_dir="${work_root}/manifests/${variant}"
-  "${python_bin}" -m dinov2_segmentation.prepare_cervical_stores \
-    --graph-dir "${graph_dir}" \
-    --context-dir "${work_root}/contexts/${variant}" \
-    --stage1-dir "${stage1_organized}" \
-    --output-dir "${store_dir}"
-  "${python_bin}" -m dinov2_segmentation.build_cervical_manifests \
-    --selection-dir "${work_root}/decoder_selection" \
-    --feature-store-dir "${store_dir}" \
-    --output-dir "${manifest_dir}"
-}
-
-prepare_variant baseline "${graph_dual}" 2>&1 | tee -a "${logs_dir}/stores_baseline.log"
-prepare_variant distance_only "${graph_distance}" 2>&1 | tee -a "${logs_dir}/stores_distance_only.log"
-prepare_variant weighted_pretrain_distance_context "${graph_distance}" 2>&1 | tee -a "${logs_dir}/stores_weighted_pretrain_distance_context.log"
-log "Aligned feature stores and fair decoder manifests complete"
+log "Cervical dual-edge and distance-only graph topology/feature memories complete"
 
 run_decoder_pair() {
   local variant="$1"
-  local manifest_dir="${work_root}/manifests/${variant}"
+  local graph_dir="$2"
+  local stage2_run_dir="${stage2_results}/${variant}/${stage2_run_id}"
   local output_root="${work_root}/decoder_runs/${variant}"
   local v1_output="${output_root}/v1"
   local v2_output="${output_root}/v2"
@@ -268,28 +226,44 @@ run_decoder_pair() {
   wait_for_gpu 0
   wait_for_gpu 1
   mkdir -p "${v1_output}" "${v2_output}"
-  log "Starting decoder pair ${variant}: V1/GPU0 and V2/GPU1"
+  log "Starting joint Stage1+Stage2+decoder pair ${variant}: V1/GPU0 and V2/GPU1"
   (
-    cd "${repo_dir}"
+    cd "${stage2_dir}"
     export CUDA_VISIBLE_DEVICES=0
-    exec "${python_bin}" -m dinov2_segmentation.train \
-      --train-manifest "${manifest_dir}/train.csv" \
-      --val-manifest "${manifest_dir}/valid.csv" \
+    export PYTHONPATH="${stage2_dir}:${repo_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+    exec "${python_bin}" -m dinov2_segmentation.train_joint \
+      --decoder-version v1 \
+      --train-manifest "${work_root}/decoder_selection/train.csv" \
+      --val-manifest "${work_root}/decoder_selection/valid.csv" \
+      --graph-dir "${graph_dir}" \
+      --stage1-config "${selected_stage1_config}" \
+      --stage1-checkpoint "${selected_stage1_checkpoint}" \
+      --stage2-config "${stage2_run_dir}/config.yaml" \
+      --stage2-checkpoint "${stage2_run_dir}/model_final.rank_0.pth" \
       --output-dir "${v1_output}" \
       --num-classes 2 --epochs "${decoder_epochs}" \
       --batch-size "${v1_batch}" --workers "${decoder_workers}" \
+      --gradient-accumulation "${joint_accumulation}" \
       "${v1_resume[@]}"
   ) > "${logs_dir}/decoder_${variant}_v1.log" 2>&1 &
   local pid_v1=$!
   (
-    cd "${repo_dir}"
+    cd "${stage2_dir}"
     export CUDA_VISIBLE_DEVICES=1
-    exec "${python_bin}" -m dinov2_segmentation.train_v2 \
-      --train-manifest "${manifest_dir}/train.csv" \
-      --val-manifest "${manifest_dir}/valid.csv" \
+    export PYTHONPATH="${stage2_dir}:${repo_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+    exec "${python_bin}" -m dinov2_segmentation.train_joint \
+      --decoder-version v2 \
+      --train-manifest "${work_root}/decoder_selection/train.csv" \
+      --val-manifest "${work_root}/decoder_selection/valid.csv" \
+      --graph-dir "${graph_dir}" \
+      --stage1-config "${selected_stage1_config}" \
+      --stage1-checkpoint "${selected_stage1_checkpoint}" \
+      --stage2-config "${stage2_run_dir}/config.yaml" \
+      --stage2-checkpoint "${stage2_run_dir}/model_final.rank_0.pth" \
       --output-dir "${v2_output}" \
       --num-classes 2 --epochs "${decoder_epochs}" \
       --batch-size "${v2_batch}" --workers "${decoder_workers}" \
+      --gradient-accumulation "${joint_accumulation}" \
       "${v2_resume[@]}"
   ) > "${logs_dir}/decoder_${variant}_v2.log" 2>&1 &
   local pid_v2=$!
@@ -302,8 +276,33 @@ run_decoder_pair() {
   log "Decoder pair complete: ${variant}"
 }
 
-run_decoder_pair baseline
-run_decoder_pair distance_only
-run_decoder_pair weighted_pretrain_distance_context
+run_decoder_pair baseline "${graph_dual}"
+run_decoder_pair distance_only "${graph_distance}"
+run_decoder_pair weighted_pretrain_distance_context "${graph_distance}"
+"${python_bin}" - "${work_root}" "${decoder_epochs}" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+epochs = int(sys.argv[2])
+variants = ("baseline", "distance_only", "weighted_pretrain_distance_context")
+for variant in variants:
+    for decoder in ("v1", "v2"):
+        output = root / "decoder_runs" / variant / decoder
+        required = (output / "complete", output / "checkpoint_last.pt", output / "history.json", output / "gradient_audit.json")
+        missing = [str(path) for path in required if not path.is_file()]
+        if missing:
+            raise SystemExit(f"Incomplete model {variant}/{decoder}: {missing}")
+        history = json.loads((output / "history.json").read_text())
+        if len(history) != epochs or int(history[-1]["epoch"]) != epochs - 1:
+            raise SystemExit(f"Epoch audit failed for {variant}/{decoder}")
+        gradients = json.loads((output / "gradient_audit.json").read_text())
+        expected = ("stage1_grad_norm", "stage2_grad_norm", "decoder_grad_norm")
+        if not all(math.isfinite(float(gradients.get(key, 0))) and float(gradients[key]) > 0 for key in expected):
+            raise SystemExit(f"Gradient audit failed for {variant}/{decoder}: {gradients}")
+print("Verified six complete joint models and non-zero Stage1/Stage2/decoder gradients")
+PY
 touch "${work_root}/six_models.complete"
 log "All six segmentation models completed"

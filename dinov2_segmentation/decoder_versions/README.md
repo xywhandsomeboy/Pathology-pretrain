@@ -13,6 +13,6 @@
 
 1. Decoder 版本开发不得修改 `dinov2_stage2_2_FmH2ST/` 下的训练配置、图数据或运行脚本。
 2. V2 完成并测试前，不修改当前 `GlobalLocalSegmentationModel` 的默认行为。
-3. 两个 Decoder 共用同一份对齐后的 DINO dense tokens、GNN context、原图 patch 和 mask，
-   便于后续公平比较。
+3. 两个 Decoder 共用相同的 Stage1/Stage2 初始化权重、图拓扑、原图 patch 和 mask；最终
+   dense tokens 与 GNN context 均在线生成并联合微调，便于公平比较。
 4. 两个版本使用独立输出目录和 checkpoint，禁止相互续训或覆盖。
