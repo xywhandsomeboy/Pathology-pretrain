@@ -8,7 +8,7 @@
 |---|---|---|---|
 | 全局语义分支 | 当前 patch 的 DINO dense tokens + 该节点的整张 WSI GNN context | 1×1 投影；GNN context 通过 FiLM 调制 token map；ConvNeXtV2 block 卷积上采样 | H/4 的高层语义图 |
 | 高分辨率分支 | 与上述节点坐标完全相同的原图 patch | 两层浅 stem 到 H/4；之后 ConvNeXtV2 与 HRFormer 局部窗口注意力交替，始终不再降采样 | H/4 的纹理、边缘和细胞细节图 |
-| 融合 Decoder | 两个 H/4 特征图 | 拼接 + 1×1 Conv；HRFormer 与 ConvNeXtV2 交替融合；两次 CNN 上采样 | 与原 patch 同分辨率的类别 logits |
+| 融合 Decoder | 两个 H/4 特征图 | 拼接 + 1×1 Conv；通道注意力；HRFormer 与 ConvNeXtV2 交替融合；两次 CNN 上采样 | 与原 patch 同分辨率的类别 logits |
 
 这里的“高分辨率”明确指 H/4 主干，而不是把 224×224 的全分辨率直接送进自注意力。这样既保留边界，又避免注意力的显存平方增长。全局语义来自分支一，分支二没有深层低分辨率语义金字塔。
 

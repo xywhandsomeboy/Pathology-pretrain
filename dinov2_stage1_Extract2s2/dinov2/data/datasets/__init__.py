@@ -7,3 +7,4 @@ from .image_net import ImageNet
 from .image_net_22k import ImageNet22k
 from .image_net_22k_self import ImageNet22kSelf
 from .image_folder import ImageFolder
+from .patch_manifest import PatchManifest

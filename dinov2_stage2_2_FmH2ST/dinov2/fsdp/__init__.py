@@ -82,6 +82,23 @@ def rankstr():
     return f"rank_{distributed.get_global_rank()}"
 
 
+def get_checkpoint_state_dict_type(model):
+    """Select a checkpoint format compatible with the actual FSDP strategy.
+
+    PyTorch automatically changes a requested sharded strategy to NO_SHARD
+    when world size is one. LOCAL_STATE_DICT is invalid in that situation, so
+    single-GPU jobs must use a full state dict. Multi-rank jobs whose wrappers
+    remain genuinely sharded keep the original local-state behavior.
+    """
+    fsdp_modules = get_fsdp_modules(model)
+    if fsdp_modules and all(
+        module.sharding_strategy is not ShardingStrategy.NO_SHARD
+        for module in fsdp_modules
+    ):
+        return StateDictType.LOCAL_STATE_DICT
+    return StateDictType.FULL_STATE_DICT
+
+
 class FSDPCheckpointer(Checkpointer):
     def save(self, name: str, **kwargs: Any) -> None:
         """
@@ -95,7 +112,8 @@ class FSDPCheckpointer(Checkpointer):
             return
 
         data = {}
-        with FSDP.state_dict_type(self.model, StateDictType.LOCAL_STATE_DICT):
+        state_dict_type = get_checkpoint_state_dict_type(self.model)
+        with FSDP.state_dict_type(self.model, state_dict_type):
             data["model"] = self.model.state_dict()
 
         # data["model"] = self.model.state_dict()
@@ -112,7 +130,8 @@ class FSDPCheckpointer(Checkpointer):
         self.tag_last_checkpoint(basename)
 
     def load(self, *args, **kwargs):
-        with FSDP.state_dict_type(self.model, StateDictType.LOCAL_STATE_DICT):
+        state_dict_type = get_checkpoint_state_dict_type(self.model)
+        with FSDP.state_dict_type(self.model, state_dict_type):
             return super().load(*args, **kwargs)
         
 

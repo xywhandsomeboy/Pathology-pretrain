@@ -393,7 +393,11 @@ class GCNMetaArch(nn.Module):
         return super().train(mode)
 
     def get_maybe_fused_params_for_submodel(self, model):
-        groups = fuse_params_groups(get_params_groups_with_decay(model=model, lr_decay_rate=self.cfg.optim.layerwise_decay, patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult))
+        # ``fuse_params_groups`` returns a ``dict_values`` view.  Materialize
+        # it here so parameter groups from the independent student modules can
+        # be concatenated below.  This changes only the container type; group
+        # membership and every optimizer option remain identical.
+        groups = list(fuse_params_groups(get_params_groups_with_decay(model=model, lr_decay_rate=self.cfg.optim.layerwise_decay, patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult)))
         for group in groups:
             group["foreach"] = True
         return groups

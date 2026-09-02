@@ -4,7 +4,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .blocks import ConvNeXtV2Block, HRFormerBlock, LayerNorm2d, UpsampleRefine
+from .blocks import (
+    ChannelAttention2d,
+    ConvNeXtV2Block,
+    HRFormerBlock,
+    LayerNorm2d,
+    UpsampleRefine,
+)
 
 
 class AttentionConvFusionDecoder(nn.Module):
@@ -27,6 +33,7 @@ class AttentionConvFusionDecoder(nn.Module):
             LayerNorm2d(channels),
             nn.GELU(),
         )
+        self.channel_attention = ChannelAttention2d(channels)
         probabilities = [drop_path_rate * index / max(depth - 1, 1) for index in range(depth)]
         blocks = []
         for index, probability in enumerate(probabilities):
@@ -62,9 +69,8 @@ class AttentionConvFusionDecoder(nn.Module):
             semantic = F.interpolate(
                 semantic, size=detail.shape[-2:], mode="bilinear", align_corners=False
             )
-        fused = self.fusion_blocks(
-            self.input_projection(torch.cat((semantic, detail), dim=1))
-        )
+        fused = self.input_projection(torch.cat((semantic, detail), dim=1))
+        fused = self.fusion_blocks(self.channel_attention(fused))
         logits = self.head(self.upsample(fused))
         if logits.shape[-2:] != output_size:
             logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)

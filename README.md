@@ -24,7 +24,9 @@ CerviPath 是宫颈病理图像的 DINOv2–GNN 预训练与分割项目。仓�
 ```
 
 详细流程见 [docs/PIPELINE.md](docs/PIPELINE.md)，字段约束见
-[docs/DATA_CONTRACT.md](docs/DATA_CONTRACT.md)。
+[docs/DATA_CONTRACT.md](docs/DATA_CONTRACT.md)。宫颈精细标注数据的部分下载触发、
+二分类标签合并与六模型队列见
+[docs/CERVICAL_SIX_MODEL_PIPELINE.md](docs/CERVICAL_SIX_MODEL_PIPELINE.md)。
 
 ## 历史项目
 

@@ -45,6 +45,33 @@ class LayerNorm2d(nn.Module):
         return x.permute(0, 3, 1, 2)
 
 
+class ChannelAttention2d(nn.Module):
+    """CBAM-style channel attention for an NCHW feature map.
+
+    Average and maximum spatial descriptors share the same projection so the
+    module can recalibrate interactions between semantic/detail channels
+    without changing the tensor shape or adding a residual connection.
+    """
+
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        if channels < 1:
+            raise ValueError("channels must be positive")
+        if reduction < 1:
+            raise ValueError("attention reduction must be positive")
+        hidden_channels = max(channels // reduction, 4)
+        self.projection = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, 1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, channels, 1, bias=False),
+        )
+
+    def forward(self, feature: torch.Tensor) -> torch.Tensor:
+        average = self.projection(F.adaptive_avg_pool2d(feature, 1))
+        maximum = self.projection(F.adaptive_max_pool2d(feature, 1))
+        return feature * torch.sigmoid(average + maximum)
+
+
 class GlobalResponseNorm(nn.Module):
     """Global Response Normalization from ConvNeXt V2 (channels last)."""
 

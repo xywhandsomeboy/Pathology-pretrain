@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ImageNet, ImageNet22k, ImageFolder
+from .datasets import ImageNet, ImageNet22k, ImageFolder, PatchManifest
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 # from torchvision.datasets import ImageFolder
 
@@ -69,6 +69,8 @@ def _parse_dataset_str(dataset_str: str):
         
     elif name == "ImageFolder":
         class_ = ImageFolder
+    elif name == "PatchManifest":
+        class_ = PatchManifest
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
 
