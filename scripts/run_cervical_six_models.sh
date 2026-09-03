@@ -283,7 +283,7 @@ run_decoder_pair() {
       --early-stopping-start-epoch "${early_stopping_start_epoch}" \
       --early-stopping-min-delta "${early_stopping_min_delta}" \
       "${v1_resume[@]}"
-  ) > "${logs_dir}/decoder_${variant}_v1.log" 2>&1 &
+  ) >> "${logs_dir}/decoder_${variant}_v1.log" 2>&1 &
   local pid_v1=$!
   (
     cd "${stage2_dir}"
@@ -314,7 +314,7 @@ run_decoder_pair() {
       --early-stopping-start-epoch "${early_stopping_start_epoch}" \
       --early-stopping-min-delta "${early_stopping_min_delta}" \
       "${v2_resume[@]}"
-  ) > "${logs_dir}/decoder_${variant}_v2.log" 2>&1 &
+  ) >> "${logs_dir}/decoder_${variant}_v2.log" 2>&1 &
   local pid_v2=$!
   local status_v1=0 status_v2=0
   wait "${pid_v1}" || status_v1=$?
