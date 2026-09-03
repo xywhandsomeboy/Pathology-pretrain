@@ -43,7 +43,8 @@ Concat → 1×1 Conv → LayerNorm → GELU → Channel Attention
 
 ## 候选训练改动：肿瘤区域加权
 
-状态：**仅记录，当前四个模型不启用。**
+状态：原始四模型保持不变；`distance_only/v1` 在 decoder-only 第 3 轮出现训练 loss
+连续下降而验证 loss 连续上升、验证 Dice 停滞后，新的独立迭代启用该方案。
 
 若模型进入 Stage1 融合层与 Stage2 联合训练阶段后，仍持续表现为 Precision 高、
 Recall 低，并且预测肿瘤像素比例明显低于真实比例，可在一组新的对照实验中调整
@@ -60,3 +61,8 @@ Dice Loss 继续保持现状。当前 Dice 对出现的背景类和肿瘤类等�
 建议备选权重为 `1.25 / 1.5 / 2.0`。必须使用新的输出目录从第 1 个 epoch 重新训练，
 不得在现有检查点中途切换损失，以免混淆实验条件。是否启用以第 4–5 个 epoch 的
 验证集 Recall、Precision、Dice 和预测肿瘤像素比例为依据。
+
+首次迭代固定使用 `--tumor-class-weight 1.5`，仅改变 Cross Entropy 的 class-1
+权重；soft Dice、网络结构、数据清单和其他优化参数均保持原对照设置。论文依据包括
+Focal Tversky 对医学分割中高 Precision/低 Recall 与假阴性加权问题的分析：
+<https://arxiv.org/abs/1810.07842>。

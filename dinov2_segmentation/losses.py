@@ -37,9 +37,21 @@ def segmentation_loss(
     ignore_index: int = 255,
     cross_entropy_weight: float = 1.0,
     dice_weight: float = 1.0,
+    tumor_class_weight: float = 1.0,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if tumor_class_weight <= 0:
+        raise ValueError("tumor_class_weight must be positive")
+    if logits.shape[1] < 2:
+        raise ValueError("tumor_class_weight requires at least two output classes")
     if (target != ignore_index).any():
-        cross_entropy = F.cross_entropy(logits.float(), target, ignore_index=ignore_index)
+        class_weights = logits.new_ones(logits.shape[1], dtype=torch.float32)
+        class_weights[1] = tumor_class_weight
+        cross_entropy = F.cross_entropy(
+            logits.float(),
+            target,
+            weight=class_weights,
+            ignore_index=ignore_index,
+        )
     else:
         cross_entropy = logits.sum() * 0.0
     dice = soft_dice_loss(logits.float(), target, ignore_index=ignore_index)

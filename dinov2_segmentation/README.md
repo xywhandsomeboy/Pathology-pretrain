@@ -71,8 +71,13 @@ Decoder `2e-4`、Stage2 GATv2 `5e-5`、Stage1 聚合/融合层 `5e-5`、Stage1 V
 默认损失为 Cross Entropy + soft Dice，`255` 为 ignore index。模型选择依据验证集肿瘤 Dice，
 同时记录 tumor IoU、pixel accuracy 和完整混淆矩阵。
 
+需要提高肿瘤漏检代价时，可为新的独立实验添加 `--tumor-class-weight 1.5`。该选项只对
+Cross Entropy 的 class 1 加权，soft Dice 保持不变；默认值 `1.0` 保持原始实验行为。
+
 完整的论文依据、参数选择和工程取舍见
 [`JOINT_TRAINING_STRATEGY.md`](JOINT_TRAINING_STRATEGY.md)。
+实际过拟合停止证据与后续单变量实验见
+[`OVERFITTING_ITERATIONS.md`](OVERFITTING_ITERATIONS.md)。
 
 ## WSI 推理与拼接
 

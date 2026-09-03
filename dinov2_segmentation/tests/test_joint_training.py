@@ -14,6 +14,7 @@ from torch_geometric.data import Data
 from dinov2_segmentation.data.joint_dataset import JointPatchSegmentationDataset
 from dinov2_segmentation.joint_graph import JointGraphRepository
 from dinov2_segmentation.joint_optim import WarmupCosineScheduler, _vit_blocks
+from dinov2_segmentation.losses import segmentation_loss
 
 
 class _TinyGNN(nn.Module):
@@ -27,6 +28,25 @@ class _TinyGNN(nn.Module):
 
 
 class JointTrainingTest(unittest.TestCase):
+    def test_tumor_class_weight_only_reweights_cross_entropy(self):
+        logits = torch.tensor(
+            [[[[2.0, 2.0]], [[0.0, 0.0]]]], dtype=torch.float32
+        )
+        target = torch.tensor([[[0, 1]]], dtype=torch.int64)
+        plain, plain_parts = segmentation_loss(logits, target)
+        weighted, weighted_parts = segmentation_loss(
+            logits, target, tumor_class_weight=1.5
+        )
+        self.assertGreater(float(weighted), float(plain))
+        self.assertGreater(
+            float(weighted_parts["cross_entropy"]),
+            float(plain_parts["cross_entropy"]),
+        )
+        self.assertEqual(
+            float(weighted_parts["dice_loss"]),
+            float(plain_parts["dice_loss"]),
+        )
+
     def test_raw_dataset_and_binary_mask(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

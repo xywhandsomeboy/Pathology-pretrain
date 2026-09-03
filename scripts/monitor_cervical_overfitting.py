@@ -69,12 +69,31 @@ def detect_overfitting(history: list[dict[str, Any]]) -> Detection | None:
             train_loss=train_loss,
         )
 
-    if len(history) < 4 or best_index >= len(history) - 2:
-        return None
     recent = history[-3:]
     train_losses = [_metric(record, "train", "loss") for record in recent]
     val_losses = [_metric(record, "val", "loss") for record in recent]
     val_dices = [_metric(record, "val", "tumor_dice") for record in recent]
+    early_loss_divergence = (
+        gap >= 0.18
+        and train_losses[0] > train_losses[1] > train_losses[2]
+        and val_losses[0] < val_losses[1] < val_losses[2]
+        and val_losses[2] >= val_losses[0] * 1.20
+        and val_dices[2] <= max(val_dices[:2])
+    )
+    if early_loss_divergence:
+        return Detection(
+            reason="sustained_validation_loss_divergence",
+            epoch=int(current["epoch"]),
+            best_epoch=int(best["epoch"]),
+            best_val_dice=best_dice,
+            val_dice=val_dice,
+            train_dice=train_dice,
+            val_loss=val_loss,
+            train_loss=train_loss,
+        )
+
+    if len(history) < 4 or best_index >= len(history) - 2:
+        return None
     sustained = (
         gap >= 0.12
         and best_dice - val_dice >= 0.03

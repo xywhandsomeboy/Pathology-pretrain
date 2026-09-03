@@ -34,6 +34,7 @@ PAPER_REFERENCES = {
     "dinov2": "https://arxiv.org/abs/2304.07193",
     "gatv2": "https://arxiv.org/abs/2105.14491",
     "dense_prediction_adapter": "https://arxiv.org/abs/2205.08534",
+    "focal_tversky": "https://arxiv.org/abs/1810.07842",
 }
 
 
@@ -71,6 +72,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr-ratio", type=float, default=0.01)
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--tumor-class-weight",
+        type=float,
+        default=1.0,
+        help="Relative class-1 weight in cross entropy; Dice remains unchanged",
+    )
     parser.add_argument("--ignore-index", type=int, default=255)
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--seed", type=int, default=42)
@@ -374,6 +381,7 @@ def _run_epoch(
                 target,
                 ignore_index=args.ignore_index,
                 dice_weight=args.dice_weight,
+                tumor_class_weight=args.tumor_class_weight,
             )
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite joint loss at batch {batch_index}: {loss}")
@@ -499,6 +507,7 @@ def _configuration(args: argparse.Namespace) -> dict:
         "min_lr_ratio",
         "clip_grad",
         "dice_weight",
+        "tumor_class_weight",
         "ignore_index",
         "amp_dtype",
         "seed",
@@ -550,6 +559,8 @@ def main() -> None:
         )
     if args.stage1_unfreeze_blocks < 0:
         raise ValueError("stage1-unfreeze-blocks must be non-negative")
+    if args.tumor_class_weight <= 0:
+        raise ValueError("tumor-class-weight must be positive")
     for name in (
         "final_phase_pretrained_lr_scale",
         "final_phase_decoder_lr_scale",
@@ -668,7 +679,11 @@ def main() -> None:
         checkpoint = _load(args.resume)
         if checkpoint.get("model_version") != system.model_version:
             raise ValueError("Resume checkpoint model version differs")
-        if checkpoint.get("configuration") != _configuration(args):
+        checkpoint_configuration = dict(checkpoint.get("configuration", {}))
+        # Checkpoints created before the opt-in class weighting flag have the
+        # same semantics as the new default and remain safely resumable.
+        checkpoint_configuration.setdefault("tumor_class_weight", 1.0)
+        if checkpoint_configuration != _configuration(args):
             raise ValueError("Resume checkpoint configuration differs")
         system.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
