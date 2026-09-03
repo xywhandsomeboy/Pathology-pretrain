@@ -19,6 +19,12 @@ from pathlib import Path
 from typing import Any
 
 
+_RUN_LAYOUTS = (
+    ("decoder_runs", "*/*/history.json"),
+    ("decoder_runs_improved", "*/*/*/history.json"),
+)
+
+
 @dataclass(frozen=True)
 class Detection:
     reason: str
@@ -166,11 +172,20 @@ def _write_detection(output_dir: Path, detection: Detection, pids: list[int]) ->
     os.replace(temporary, destination)
 
 
+def _discover_run_histories(work_root: Path) -> list[tuple[Path, Path]]:
+    """Return ``(runs_root, history_path)`` pairs for every supported layout."""
+    histories: list[tuple[Path, Path]] = []
+    for root_name, pattern in _RUN_LAYOUTS:
+        runs_root = work_root / root_name
+        histories.extend((runs_root, path) for path in runs_root.glob(pattern))
+    return sorted(histories, key=lambda item: str(item[1]))
+
+
 def _run_once(work_root: Path, stop_on_detection: bool, seen: dict[Path, int]) -> bool:
     changed = False
-    runs_root = work_root / "decoder_runs"
-    for history_path in sorted(runs_root.glob("*/*/history.json")):
+    for runs_root, history_path in _discover_run_histories(work_root):
         output_dir = history_path.parent
+        run_name = str(output_dir.relative_to(runs_root))
         if (output_dir / "overfitting_detected.json").exists():
             continue
         try:
@@ -185,7 +200,8 @@ def _run_once(work_root: Path, stop_on_detection: bool, seen: dict[Path, int]) -
                 json.dumps(
                     {
                         "observed_at": datetime.now().astimezone().isoformat(),
-                        "run": str(output_dir.relative_to(runs_root)),
+                        "runs_root": runs_root.name,
+                        "run": run_name,
                         "completed_epochs": len(history),
                         "epoch": int(latest["epoch"]),
                         "train_loss": _metric(latest, "train", "loss"),
@@ -205,7 +221,8 @@ def _run_once(work_root: Path, stop_on_detection: bool, seen: dict[Path, int]) -
         print(
             json.dumps(
                 {
-                    "overfitting_detected": str(output_dir.relative_to(runs_root)),
+                    "runs_root": runs_root.name,
+                    "overfitting_detected": run_name,
                     **detection.__dict__,
                     "training_root_pids": pids,
                     "stop_on_detection": stop_on_detection,

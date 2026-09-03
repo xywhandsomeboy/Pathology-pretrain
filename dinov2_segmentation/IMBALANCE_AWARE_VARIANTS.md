@@ -71,6 +71,18 @@ scripts/run_cervical_improved_variant.sh \
 建议先在当前表现最好的 Stage2/Decoder 组合上完成 S、ST、STA 三项消融，再决定是否扩展到
 全部六种架构组合，避免一次混入多个变量。
 
+## 过拟合监控
+
+监控器同时扫描原版 `decoder_runs/*/*` 和改进版 `decoder_runs_improved/*/*/*`。它只读取
+完整 epoch 写出的训练/验证指标；触发明确的连续 loss 分叉或 Dice 崩塌时，先写入
+`overfitting_detected.json`，再终止与该输出目录精确匹配的训练主进程：
+
+```bash
+/path/to/python scripts/monitor_cervical_overfitting.py \
+  --work-root Data/cervical_segmentation_expanded_min64_b4 \
+  --poll-seconds 30 --stop-on-detection
+```
+
 ## 推理阈值
 
 `infer.py` 和 `infer_v2.py` 新增可选参数：
