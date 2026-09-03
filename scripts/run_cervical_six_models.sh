@@ -234,6 +234,14 @@ run_decoder_pair() {
   local v2_output="${output_root}/v2"
   local -a v1_resume=()
   local -a v2_resume=()
+  while pgrep -f -- "--output-dir ${v1_output}" >/dev/null; do
+    log "Waiting for independently running decoder: ${variant}/v1"
+    sleep "${poll_seconds}"
+  done
+  while pgrep -f -- "--output-dir ${v2_output}" >/dev/null; do
+    log "Waiting for independently running decoder: ${variant}/v2"
+    sleep "${poll_seconds}"
+  done
   if [[ -f "${v1_output}/checkpoint_last.pt" ]]; then
     v1_resume=(--resume "${v1_output}/checkpoint_last.pt")
   elif [[ -n "$(find "${v1_output}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
