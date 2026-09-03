@@ -40,3 +40,23 @@ Concat → 1×1 Conv → LayerNorm → GELU → Channel Attention
 
 当前实现位置：`dinov2_segmentation/models/fusion_decoder.py` 中的
 `AttentionConvFusionDecoder.input_projection`。
+
+## 候选训练改动：肿瘤区域加权
+
+状态：**仅记录，当前四个模型不启用。**
+
+若模型进入 Stage1 融合层与 Stage2 联合训练阶段后，仍持续表现为 Precision 高、
+Recall 低，并且预测肿瘤像素比例明显低于真实比例，可在一组新的对照实验中调整
+二分类交叉熵：
+
+```text
+background class weight = 1.0
+tumor class weight      = 1.5（首选）
+```
+
+Dice Loss 继续保持现状。当前 Dice 对出现的背景类和肿瘤类等权平均，已经具有类别
+平衡作用；先只提高交叉熵中的肿瘤权重，可以较温和地提升漏检肿瘤像素的代价。
+
+建议备选权重为 `1.25 / 1.5 / 2.0`。必须使用新的输出目录从第 1 个 epoch 重新训练，
+不得在现有检查点中途切换损失，以免混淆实验条件。是否启用以第 4–5 个 epoch 的
+验证集 Recall、Precision、Dice 和预测肿瘤像素比例为依据。
