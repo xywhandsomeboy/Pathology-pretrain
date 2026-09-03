@@ -57,7 +57,19 @@ class DiskBackedSlideStitcher:
         self.scores[:, y : y + patch_height, x : x + patch_width] += probability * weight
         self.weights[y : y + patch_height, x : x + patch_width] += weight
 
-    def finalize(self, stripe_height: int = 1024) -> Path:
+    def finalize(
+        self,
+        stripe_height: int = 1024,
+        *,
+        tumor_threshold: float | None = None,
+    ) -> Path:
+        if tumor_threshold is not None:
+            if self.num_classes != 2:
+                raise ValueError(
+                    "tumor_threshold is only valid for binary segmentation"
+                )
+            if not 0.0 < tumor_threshold < 1.0:
+                raise ValueError("tumor_threshold must be strictly between 0 and 1")
         self.scores.flush()
         self.weights.flush()
         mask_path = self.output_dir / "segmentation.npy"
@@ -68,7 +80,10 @@ class DiskBackedSlideStitcher:
             stop = min(start + stripe_height, self.shape[0])
             weight = np.asarray(self.weights[start:stop]).clip(min=1e-8)
             score = np.asarray(self.scores[:, start:stop]) / weight[None]
-            prediction = score.argmax(axis=0).astype(np.uint16)
+            if tumor_threshold is None:
+                prediction = score.argmax(axis=0).astype(np.uint16)
+            else:
+                prediction = (score[1] >= tumor_threshold).astype(np.uint16)
             prediction[np.asarray(self.weights[start:stop]) == 0] = 0
             mask[start:stop] = prediction
         mask.flush()

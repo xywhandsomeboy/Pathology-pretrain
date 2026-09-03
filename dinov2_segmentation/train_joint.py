@@ -24,6 +24,12 @@ from dinov2_segmentation.joint_optim import (
     build_joint_adamw,
 )
 from dinov2_segmentation.losses import segmentation_loss
+from dinov2_segmentation.probability_metrics import (
+    BinaryProbabilityMetrics,
+    binary_confusion_metrics,
+)
+from dinov2_segmentation.profiles import validate_experiment_profile
+from dinov2_segmentation.sampling import SlideStratifiedSampler
 
 
 PAPER_REFERENCES = {
@@ -34,7 +40,9 @@ PAPER_REFERENCES = {
     "dinov2": "https://arxiv.org/abs/2304.07193",
     "gatv2": "https://arxiv.org/abs/2105.14491",
     "dense_prediction_adapter": "https://arxiv.org/abs/2205.08534",
+    "tversky": "https://arxiv.org/abs/1706.05721",
     "focal_tversky": "https://arxiv.org/abs/1810.07842",
+    "pathology_color_augmentation": "https://pubmed.ncbi.nlm.nih.gov/31466046/",
 }
 
 
@@ -56,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stage2-config", type=Path, required=True)
     parser.add_argument("--stage2-checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--experiment-profile",
+        choices=("current", "S", "ST", "STA"),
+        default="current",
+        help="Recorded ablation identity; profile flags are supplied by the launcher",
+    )
     parser.add_argument("--num-classes", type=int, default=2)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--epochs", type=int, default=50)
@@ -71,14 +85,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--min-lr-ratio", type=float, default=0.01)
     parser.add_argument("--clip-grad", type=float, default=1.0)
-    parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument("--cross-entropy-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--dice-weight",
+        "--overlap-weight",
+        dest="dice_weight",
+        type=float,
+        default=1.0,
+        help="Weight for the selected Dice or Tversky overlap term",
+    )
+    parser.add_argument(
+        "--overlap-loss",
+        choices=("dice", "foreground_tversky"),
+        default="dice",
+    )
+    parser.add_argument("--tversky-alpha", type=float, default=0.3, help="FP weight")
+    parser.add_argument("--tversky-beta", type=float, default=0.7, help="FN weight")
     parser.add_argument(
         "--tumor-class-weight",
         type=float,
         default=1.0,
-        help="Relative class-1 weight in cross entropy; Dice remains unchanged",
+        help="Relative class-1 weight in cross entropy; overlap loss remains unchanged",
     )
     parser.add_argument("--ignore-index", type=int, default=255)
+    parser.add_argument(
+        "--sampling-mode",
+        choices=("uniform", "slide_stratified"),
+        default="uniform",
+    )
+    parser.add_argument("--sampling-positive-fraction", type=float, default=0.60)
+    parser.add_argument(
+        "--sampling-boundary-positive-fraction", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--sampling-interior-threshold", type=float, default=0.999999
+    )
+    parser.add_argument("--sampling-slide-balance-power", type=float, default=0.5)
+    parser.add_argument("--sampling-max-patch-repeats", type=int, default=2)
+    parser.add_argument(
+        "--sampling-epoch-samples",
+        type=int,
+        default=0,
+        help="Samples per balanced epoch; zero keeps the manifest length",
+    )
+    parser.add_argument(
+        "--color-augmentation", choices=("none", "mild"), default="none"
+    )
+    parser.add_argument(
+        "--probability-metric-bins",
+        type=int,
+        default=0,
+        help="Streaming validation histogram bins; zero disables probability metrics",
+    )
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path)
@@ -151,12 +209,27 @@ def _loader(path: Path, args: argparse.Namespace, training: bool) -> DataLoader:
         path,
         image_size=args.image_size,
         training=training,
+        color_augmentation=args.color_augmentation if training else "none",
     )
     generator = torch.Generator().manual_seed(args.seed + int(training))
+    sampler = None
+    if training and args.sampling_mode == "slide_stratified":
+        sampler = SlideStratifiedSampler(
+            dataset.rows,
+            num_samples=args.sampling_epoch_samples or len(dataset),
+            batch_size=args.batch_size,
+            positive_fraction=args.sampling_positive_fraction,
+            boundary_positive_fraction=args.sampling_boundary_positive_fraction,
+            interior_threshold=args.sampling_interior_threshold,
+            slide_balance_power=args.sampling_slide_balance_power,
+            max_patch_repeats=args.sampling_max_patch_repeats,
+            seed=args.seed,
+        )
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=training,
+        shuffle=training and sampler is None,
+        sampler=sampler,
         num_workers=args.workers,
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
@@ -309,21 +382,17 @@ def _confusion_update(
     ).reshape(num_classes, num_classes)
 
 
-def _metrics(totals: dict, samples: int, confusion: torch.Tensor) -> dict:
+def _metrics(
+    totals: dict,
+    samples: int,
+    confusion: torch.Tensor,
+    probability_metrics: BinaryProbabilityMetrics | None = None,
+) -> dict:
     result = {name: value / max(samples, 1) for name, value in totals.items()}
-    true_positive = float(confusion[1, 1])
-    false_positive = float(confusion[0, 1])
-    false_negative = float(confusion[1, 0])
-    denominator_dice = 2 * true_positive + false_positive + false_negative
-    denominator_iou = true_positive + false_positive + false_negative
-    result["tumor_dice"] = (
-        2 * true_positive / denominator_dice if denominator_dice else 1.0
-    )
-    result["tumor_iou"] = true_positive / denominator_iou if denominator_iou else 1.0
-    result["pixel_accuracy"] = float(confusion.diag().sum()) / max(
-        float(confusion.sum()), 1.0
-    )
+    result.update(binary_confusion_metrics(confusion))
     result["confusion"] = confusion.tolist()
+    if probability_metrics is not None:
+        result.update(probability_metrics.compute())
     return result
 
 
@@ -342,8 +411,18 @@ def _run_epoch(
 ) -> dict:
     training = optimizer is not None
     _set_runtime_modes(system, training=training, phase=training_phase)
-    totals = {"loss": 0.0, "cross_entropy": 0.0, "dice_loss": 0.0}
+    totals = {
+        "loss": 0.0,
+        "cross_entropy": 0.0,
+        "dice_loss": 0.0,
+        "tversky_loss": 0.0,
+    }
     confusion = torch.zeros((args.num_classes, args.num_classes), dtype=torch.int64)
+    probability_metrics = (
+        BinaryProbabilityMetrics(args.probability_metric_bins)
+        if args.probability_metric_bins > 0
+        else None
+    )
     samples = 0
     accumulation = args.gradient_accumulation if training else 1
     micro_count = 0
@@ -380,8 +459,12 @@ def _run_epoch(
                 logits,
                 target,
                 ignore_index=args.ignore_index,
+                cross_entropy_weight=args.cross_entropy_weight,
                 dice_weight=args.dice_weight,
                 tumor_class_weight=args.tumor_class_weight,
+                overlap_loss=args.overlap_loss,
+                tversky_alpha=args.tversky_alpha,
+                tversky_beta=args.tversky_beta,
             )
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite joint loss at batch {batch_index}: {loss}")
@@ -465,6 +548,12 @@ def _run_epoch(
             num_classes=args.num_classes,
             ignore_index=args.ignore_index,
         )
+        if probability_metrics is not None:
+            probability_metrics.update(
+                logits,
+                target,
+                ignore_index=args.ignore_index,
+            )
         if training and (batch_index + 1) % args.log_interval == 0:
             elapsed = time.monotonic() - start
             print(
@@ -480,7 +569,7 @@ def _run_epoch(
                 ),
                 flush=True,
             )
-    return _metrics(totals, samples, confusion)
+    return _metrics(totals, samples, confusion, probability_metrics)
 
 
 def _atomic_torch_save(payload: dict, path: Path) -> None:
@@ -491,6 +580,7 @@ def _atomic_torch_save(payload: dict, path: Path) -> None:
 
 def _configuration(args: argparse.Namespace) -> dict:
     keys = (
+        "experiment_profile",
         "decoder_version",
         "num_classes",
         "image_size",
@@ -506,9 +596,22 @@ def _configuration(args: argparse.Namespace) -> dict:
         "warmup_ratio",
         "min_lr_ratio",
         "clip_grad",
+        "cross_entropy_weight",
         "dice_weight",
         "tumor_class_weight",
+        "overlap_loss",
+        "tversky_alpha",
+        "tversky_beta",
         "ignore_index",
+        "sampling_mode",
+        "sampling_positive_fraction",
+        "sampling_boundary_positive_fraction",
+        "sampling_interior_threshold",
+        "sampling_slide_balance_power",
+        "sampling_max_patch_repeats",
+        "sampling_epoch_samples",
+        "color_augmentation",
+        "probability_metric_bins",
         "amp_dtype",
         "seed",
         "gradient_audit_updates",
@@ -561,6 +664,27 @@ def main() -> None:
         raise ValueError("stage1-unfreeze-blocks must be non-negative")
     if args.tumor_class_weight <= 0:
         raise ValueError("tumor-class-weight must be positive")
+    if args.cross_entropy_weight < 0 or args.dice_weight < 0:
+        raise ValueError("loss component weights must be non-negative")
+    if args.cross_entropy_weight == 0 and args.dice_weight == 0:
+        raise ValueError("at least one loss component must be enabled")
+    if args.tversky_alpha <= 0 or args.tversky_beta <= 0:
+        raise ValueError("Tversky alpha and beta must be positive")
+    if not 0 < args.sampling_positive_fraction < 1:
+        raise ValueError("sampling-positive-fraction must be in (0,1)")
+    if not 0 < args.sampling_boundary_positive_fraction < 1:
+        raise ValueError("sampling-boundary-positive-fraction must be in (0,1)")
+    if not 0 < args.sampling_interior_threshold <= 1:
+        raise ValueError("sampling-interior-threshold must be in (0,1]")
+    if not 0 <= args.sampling_slide_balance_power <= 1:
+        raise ValueError("sampling-slide-balance-power must be in [0,1]")
+    if args.sampling_max_patch_repeats < 1:
+        raise ValueError("sampling-max-patch-repeats must be positive")
+    if args.sampling_epoch_samples < 0:
+        raise ValueError("sampling-epoch-samples must be non-negative")
+    if args.probability_metric_bins != 0 and args.probability_metric_bins < 16:
+        raise ValueError("probability-metric-bins must be zero or at least 16")
+    validate_experiment_profile(args)
     for name in (
         "final_phase_pretrained_lr_scale",
         "final_phase_decoder_lr_scale",
@@ -641,6 +765,14 @@ def main() -> None:
         "stage2_checkpoint": str(args.stage2_checkpoint),
         "graph_dir": str(args.graph_dir),
         "stage2_runtime": runtime.__dict__,
+        "sampling": getattr(
+            train_loader.sampler,
+            "summary",
+            {
+                "name": "uniform_patch",
+                "num_samples": len(train_loader.dataset),
+            },
+        ),
         "optimizer_groups": group_metadata,
         "scheduler": {
             "name": "linear_warmup_single_cosine_decay",
@@ -682,7 +814,25 @@ def main() -> None:
         checkpoint_configuration = dict(checkpoint.get("configuration", {}))
         # Checkpoints created before the opt-in class weighting flag have the
         # same semantics as the new default and remain safely resumable.
-        checkpoint_configuration.setdefault("tumor_class_weight", 1.0)
+        backward_compatible_defaults = {
+            "experiment_profile": "current",
+            "tumor_class_weight": 1.0,
+            "cross_entropy_weight": 1.0,
+            "overlap_loss": "dice",
+            "tversky_alpha": 0.3,
+            "tversky_beta": 0.7,
+            "sampling_mode": "uniform",
+            "sampling_positive_fraction": 0.60,
+            "sampling_boundary_positive_fraction": 0.50,
+            "sampling_interior_threshold": 0.999999,
+            "sampling_slide_balance_power": 0.5,
+            "sampling_max_patch_repeats": 2,
+            "sampling_epoch_samples": 0,
+            "color_augmentation": "none",
+            "probability_metric_bins": 0,
+        }
+        for name, value in backward_compatible_defaults.items():
+            checkpoint_configuration.setdefault(name, value)
         if checkpoint_configuration != _configuration(args):
             raise ValueError("Resume checkpoint configuration differs")
         system.load_state_dict(checkpoint["model"])
@@ -706,6 +856,9 @@ def main() -> None:
             ]
 
     for epoch in range(start_epoch, args.epochs):
+        set_sampler_epoch = getattr(train_loader.sampler, "set_epoch", None)
+        if callable(set_sampler_epoch):
+            set_sampler_epoch(epoch)
         phase = _training_phase(system, optimizer, scheduler, epoch, args)
         print(
             json.dumps(

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
+import random
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 import numpy as np
@@ -14,7 +16,9 @@ from torch_geometric.data import Data
 from dinov2_segmentation.data.joint_dataset import JointPatchSegmentationDataset
 from dinov2_segmentation.joint_graph import JointGraphRepository
 from dinov2_segmentation.joint_optim import WarmupCosineScheduler, _vit_blocks
-from dinov2_segmentation.losses import segmentation_loss
+from dinov2_segmentation.losses import foreground_tversky_loss, segmentation_loss
+from dinov2_segmentation.probability_metrics import binary_confusion_metrics
+from dinov2_segmentation.profiles import validate_experiment_profile
 
 
 class _TinyGNN(nn.Module):
@@ -28,6 +32,71 @@ class _TinyGNN(nn.Module):
 
 
 class JointTrainingTest(unittest.TestCase):
+    @staticmethod
+    def _profile_args(profile: str = "ST") -> SimpleNamespace:
+        return SimpleNamespace(
+            experiment_profile=profile,
+            sampling_mode="slide_stratified",
+            sampling_positive_fraction=0.60,
+            sampling_boundary_positive_fraction=0.50,
+            sampling_slide_balance_power=0.50,
+            sampling_max_patch_repeats=2,
+            overlap_loss="dice" if profile == "S" else "foreground_tversky",
+            cross_entropy_weight=1.0,
+            dice_weight=1.0,
+            tumor_class_weight=1.0,
+            tversky_alpha=0.3,
+            tversky_beta=0.7,
+            color_augmentation="mild" if profile == "STA" else "none",
+            probability_metric_bins=256,
+        )
+
+    def test_named_profiles_accept_only_their_fixed_ablation(self):
+        for profile in ("S", "ST", "STA"):
+            validate_experiment_profile(self._profile_args(profile))
+
+    def test_named_profile_rejects_mislabeled_configuration(self):
+        args = self._profile_args()
+        args.sampling_mode = "uniform"
+        with self.assertRaisesRegex(ValueError, "sampling_mode"):
+            validate_experiment_profile(args)
+
+    def test_confusion_metrics_expose_under_segmentation(self):
+        confusion = torch.tensor([[80, 10], [20, 40]], dtype=torch.int64)
+        result = binary_confusion_metrics(confusion)
+        self.assertAlmostEqual(result["tumor_precision"], 0.8)
+        self.assertAlmostEqual(result["tumor_recall"], 2 / 3)
+        self.assertAlmostEqual(result["tumor_specificity"], 8 / 9)
+        self.assertAlmostEqual(result["predicted_tumor_fraction"], 1 / 3)
+        self.assertAlmostEqual(result["true_tumor_fraction"], 0.4)
+
+    def test_foreground_tversky_emphasizes_false_negatives(self):
+        target = torch.tensor([[[1, 0]]], dtype=torch.int64)
+        missed_tumor = torch.tensor(
+            [[[[0.0, 0.0]], [[-2.1972246, -2.1972246]]]], dtype=torch.float32
+        )
+        false_alarm = torch.tensor(
+            [[[[0.0, 0.0]], [[2.1972246, 2.1972246]]]], dtype=torch.float32
+        )
+        fn_loss = foreground_tversky_loss(
+            missed_tumor, target, alpha=0.3, beta=0.7
+        )
+        fp_loss = foreground_tversky_loss(
+            false_alarm, target, alpha=0.3, beta=0.7
+        )
+        self.assertGreater(float(fn_loss), float(fp_loss))
+
+    def test_foreground_tversky_defers_empty_masks_to_cross_entropy(self):
+        logits = torch.randn(2, 2, 4, 4, requires_grad=True)
+        target = torch.zeros(2, 4, 4, dtype=torch.int64)
+        total, parts = segmentation_loss(
+            logits, target, overlap_loss="foreground_tversky"
+        )
+        self.assertEqual(float(parts["tversky_loss"]), 0.0)
+        self.assertGreater(float(parts["cross_entropy"]), 0.0)
+        total.backward()
+        self.assertGreater(float(logits.grad.abs().sum()), 0.0)
+
     def test_tumor_class_weight_only_reweights_cross_entropy(self):
         logits = torch.tensor(
             [[[[2.0, 2.0]], [[0.0, 0.0]]]], dtype=torch.float32
@@ -85,6 +154,60 @@ class JointTrainingTest(unittest.TestCase):
             )[0]
             self.assertEqual(tuple(sample["image"].shape), (3, 8, 8))
             self.assertEqual(set(sample["mask"].unique().tolist()), {0, 1})
+
+    def test_mild_color_augmentation_changes_only_the_image(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "patch.png"
+            mask_path = root / "mask.png"
+            image = np.zeros((8, 8, 3), dtype=np.uint8)
+            image[..., 0] = 180
+            image[..., 1] = 90
+            image[..., 2] = 45
+            mask = np.eye(8, dtype=np.uint8)
+            Image.fromarray(image).save(image_path)
+            Image.fromarray(mask).save(mask_path)
+            manifest = root / "manifest.csv"
+            with manifest.open("w", newline="", encoding="utf-8") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=(
+                        "slide_id",
+                        "patch_id",
+                        "image_path",
+                        "mask_path",
+                        "x",
+                        "y",
+                        "level",
+                    ),
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "slide_id": "slide",
+                        "patch_id": "patch",
+                        "image_path": image_path,
+                        "mask_path": mask_path,
+                        "x": 0,
+                        "y": 0,
+                        "level": 1,
+                    }
+                )
+            plain = JointPatchSegmentationDataset(
+                manifest, image_size=8, training=False
+            )[0]
+            random.seed(3)
+            torch.manual_seed(3)
+            augmented = JointPatchSegmentationDataset(
+                manifest,
+                image_size=8,
+                training=True,
+                horizontal_flip_probability=0,
+                vertical_flip_probability=0,
+                color_augmentation="mild",
+            )[0]
+            self.assertFalse(torch.equal(plain["image"], augmented["image"]))
+            self.assertTrue(torch.equal(plain["mask"], augmented["mask"]))
 
     def test_context_keeps_online_stage1_and_stage2_gradients(self):
         with tempfile.TemporaryDirectory() as directory:

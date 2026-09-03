@@ -23,6 +23,11 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--tumor-threshold",
+        type=float,
+        help="Optional validation-selected class-1 probability threshold",
+    )
     parser.add_argument("--no-amp", action="store_true")
     return parser.parse_args()
 
@@ -40,6 +45,8 @@ def _slide_extents(dataset):
 
 def main():
     args = parse_args()
+    if args.tumor_threshold is not None and not 0.0 < args.tumor_threshold < 1.0:
+        raise ValueError("tumor-threshold must be strictly between 0 and 1")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model = GlobalLocalSegmentationModel(**checkpoint["model_config"])
@@ -98,7 +105,7 @@ def main():
                 key = (batch["slide_id"][index], int(batch["level"][index]))
                 stitchers[key].add(patch_probability, x, y)
     for key, stitcher in stitchers.items():
-        path = stitcher.finalize()
+        path = stitcher.finalize(tumor_threshold=args.tumor_threshold)
         print(f"Saved {key[0]} level {key[1]}: {path}")
 
 

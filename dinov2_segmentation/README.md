@@ -74,6 +74,12 @@ Decoder `2e-4`、Stage2 GATv2 `5e-5`、Stage1 聚合/融合层 `5e-5`、Stage1 V
 需要提高肿瘤漏检代价时，可为新的独立实验添加 `--tumor-class-weight 1.5`。该选项只对
 Cross Entropy 的 class 1 加权，soft Dice 保持不变；默认值 `1.0` 保持原始实验行为。
 
+针对当前数据中“大病灶与病灶内部 patch 占主导、验证 recall 低于 precision”的问题，另有
+互不覆盖原输出的 S（WSI/边界分层采样）、ST（S + 前景 Tversky）和 STA（ST + 温和颜色
+增强）三个训练策略版本。它们同时记录 precision、recall、F2、PR-AUC 近似值和验证集最优
+F2 阈值。完整参数、实测数据分布与启动命令见
+[`IMBALANCE_AWARE_VARIANTS.md`](IMBALANCE_AWARE_VARIANTS.md)。
+
 完整的论文依据、参数选择和工程取舍见
 [`JOINT_TRAINING_STRATEGY.md`](JOINT_TRAINING_STRATEGY.md)。
 实际过拟合停止证据与后续单变量实验见

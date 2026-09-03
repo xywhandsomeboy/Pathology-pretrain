@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image
 import torch
 from torch.utils.data import Dataset
+from torchvision.transforms import ColorJitter
 
 
 REQUIRED_COLUMNS = {
@@ -43,6 +44,7 @@ class JointPatchSegmentationDataset(Dataset):
         training: bool = False,
         horizontal_flip_probability: float = 0.5,
         vertical_flip_probability: float = 0.5,
+        color_augmentation: str = "none",
         mean=(0.485, 0.456, 0.406),
         std=(0.229, 0.224, 0.225),
         check_paths: bool = True,
@@ -56,6 +58,17 @@ class JointPatchSegmentationDataset(Dataset):
         )
         self.vertical_flip_probability = (
             float(vertical_flip_probability) if training else 0.0
+        )
+        self.color_augmentation = str(color_augmentation)
+        if self.color_augmentation not in {"none", "mild"}:
+            raise ValueError(
+                "color_augmentation must be 'none' or 'mild', got "
+                f"{self.color_augmentation!r}"
+            )
+        self.color_transform = (
+            ColorJitter(brightness=0.10, contrast=0.10, saturation=0.08, hue=0.02)
+            if training and self.color_augmentation == "mild"
+            else None
         )
         self.mean = torch.tensor(mean, dtype=torch.float32)[:, None, None]
         self.std = torch.tensor(std, dtype=torch.float32)[:, None, None]
@@ -114,6 +127,8 @@ class JointPatchSegmentationDataset(Dataset):
         if random.random() < self.vertical_flip_probability:
             image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
             mask = mask.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
+        if self.color_transform is not None:
+            image = self.color_transform(image)
 
         image_array = np.asarray(image, dtype=np.float32).copy() / 255.0
         image_tensor = torch.from_numpy(image_array).permute(2, 0, 1)
