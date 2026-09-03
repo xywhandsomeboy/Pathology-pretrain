@@ -71,6 +71,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-lr-ratio", type=float, default=0.01)
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--dice-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--tumor-ce-weight",
+        type=float,
+        default=1.0,
+        help="Class weight for tumor pixels in binary cross entropy",
+    )
     parser.add_argument("--ignore-index", type=int, default=255)
     parser.add_argument("--amp-dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--seed", type=int, default=42)
@@ -374,6 +380,7 @@ def _run_epoch(
                 target,
                 ignore_index=args.ignore_index,
                 dice_weight=args.dice_weight,
+                tumor_ce_weight=args.tumor_ce_weight,
             )
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Non-finite joint loss at batch {batch_index}: {loss}")
@@ -499,6 +506,7 @@ def _configuration(args: argparse.Namespace) -> dict:
         "min_lr_ratio",
         "clip_grad",
         "dice_weight",
+        "tumor_ce_weight",
         "ignore_index",
         "amp_dtype",
         "seed",
@@ -544,6 +552,8 @@ def main() -> None:
         )
     if not 0 <= args.warmup_ratio < 1:
         raise ValueError("warmup-ratio must be in [0,1)")
+    if args.tumor_ce_weight <= 0:
+        raise ValueError("tumor-ce-weight must be positive")
     if not 0 <= args.decoder_only_epochs <= args.stage1_top_unfreeze_epoch < args.epochs:
         raise ValueError(
             "Require 0 <= decoder-only-epochs <= stage1-top-unfreeze-epoch < epochs"

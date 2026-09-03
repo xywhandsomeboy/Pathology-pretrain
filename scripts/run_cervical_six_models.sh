@@ -32,6 +32,7 @@ stage1_unfreeze_blocks="${STAGE1_UNFREEZE_BLOCKS:-4}"
 early_stopping_patience="${EARLY_STOPPING_PATIENCE:-3}"
 early_stopping_start_epoch="${EARLY_STOPPING_START_EPOCH:-12}"
 early_stopping_min_delta="${EARLY_STOPPING_MIN_DELTA:-0.001}"
+tumor_ce_weight="${TUMOR_CE_WEIGHT:-1.5}"
 joint_variants_raw="${JOINT_VARIANTS:-baseline distance_only weighted_pretrain_distance_context}"
 read -r -a joint_variants <<< "${joint_variants_raw}"
 (( ${#joint_variants[@]} > 0 )) || {
@@ -287,6 +288,7 @@ run_decoder_pair() {
       --stage1-unfreeze-blocks "${stage1_unfreeze_blocks}" \
       --final-phase-pretrained-lr-scale 0.5 \
       --final-phase-decoder-lr-scale 0.5 \
+      --tumor-ce-weight "${tumor_ce_weight}" \
       --early-stopping-patience "${early_stopping_patience}" \
       --early-stopping-start-epoch "${early_stopping_start_epoch}" \
       --early-stopping-min-delta "${early_stopping_min_delta}" \
@@ -318,6 +320,7 @@ run_decoder_pair() {
       --stage1-unfreeze-blocks "${stage1_unfreeze_blocks}" \
       --final-phase-pretrained-lr-scale 0.5 \
       --final-phase-decoder-lr-scale 0.5 \
+      --tumor-ce-weight "${tumor_ce_weight}" \
       --early-stopping-patience "${early_stopping_patience}" \
       --early-stopping-start-epoch "${early_stopping_start_epoch}" \
       --early-stopping-min-delta "${early_stopping_min_delta}" \
