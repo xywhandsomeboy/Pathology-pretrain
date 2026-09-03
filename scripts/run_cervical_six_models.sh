@@ -23,6 +23,8 @@ decoder_workers="${DECODER_WORKERS:-8}"
 prepare_workers="${PREPARE_WORKERS:-4}"
 v1_batch="${V1_BATCH_SIZE:-16}"
 v2_batch="${V2_BATCH_SIZE:-16}"
+v1_gpu="${V1_GPU_ID:-0}"
+v2_gpu="${V2_GPU_ID:-1}"
 joint_accumulation="${JOINT_GRADIENT_ACCUMULATION:-1}"
 decoder_only_epochs="${DECODER_ONLY_EPOCHS:-3}"
 stage1_top_unfreeze_epoch="${STAGE1_TOP_UNFREEZE_EPOCH:-8}"
@@ -246,13 +248,15 @@ run_decoder_pair() {
     log "Decoder pair already complete: ${variant}"
     return
   fi
-  wait_for_gpu 0
-  wait_for_gpu 1
+  wait_for_gpu "${v1_gpu}"
+  if [[ "${v2_gpu}" != "${v1_gpu}" ]]; then
+    wait_for_gpu "${v2_gpu}"
+  fi
   mkdir -p "${v1_output}" "${v2_output}"
-  log "Starting joint Stage1+Stage2+decoder pair ${variant}: V1/GPU0 and V2/GPU1"
+  log "Starting joint Stage1+Stage2+decoder pair ${variant}: V1/GPU${v1_gpu} and V2/GPU${v2_gpu}"
   (
     cd "${stage2_dir}"
-    export CUDA_VISIBLE_DEVICES=0
+    export CUDA_VISIBLE_DEVICES="${v1_gpu}"
     export PYTHONPATH="${stage2_dir}:${repo_dir}${PYTHONPATH:+:${PYTHONPATH}}"
     exec "${python_bin}" -m dinov2_segmentation.train_joint \
       --decoder-version v1 \
@@ -283,7 +287,7 @@ run_decoder_pair() {
   local pid_v1=$!
   (
     cd "${stage2_dir}"
-    export CUDA_VISIBLE_DEVICES=1
+    export CUDA_VISIBLE_DEVICES="${v2_gpu}"
     export PYTHONPATH="${stage2_dir}:${repo_dir}${PYTHONPATH:+:${PYTHONPATH}}"
     exec "${python_bin}" -m dinov2_segmentation.train_joint \
       --decoder-version v2 \
