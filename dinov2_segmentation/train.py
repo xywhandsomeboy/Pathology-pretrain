@@ -38,7 +38,6 @@ def parse_args():
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--ignore-index", type=int, default=255)
     parser.add_argument("--dice-weight", type=float, default=1.0)
-    parser.add_argument("--tumor-ce-weight", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--no-amp", action="store_true")
@@ -117,7 +116,6 @@ def _run_epoch(model, loader, device, args, optimizer=None, scaler=None):
                 target,
                 ignore_index=args.ignore_index,
                 dice_weight=args.dice_weight,
-                tumor_ce_weight=args.tumor_ce_weight,
             )
         if training:
             scaler.scale(loss).backward()

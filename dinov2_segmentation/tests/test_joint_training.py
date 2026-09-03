@@ -14,7 +14,6 @@ from torch_geometric.data import Data
 from dinov2_segmentation.data.joint_dataset import JointPatchSegmentationDataset
 from dinov2_segmentation.joint_graph import JointGraphRepository
 from dinov2_segmentation.joint_optim import WarmupCosineScheduler, _vit_blocks
-from dinov2_segmentation.losses import segmentation_loss
 
 
 class _TinyGNN(nn.Module):
@@ -151,18 +150,6 @@ class JointTrainingTest(unittest.TestCase):
         self.assertAlmostEqual(
             optimizer.param_groups[1]["lr"] / optimizer.param_groups[0]["lr"],
             2.0,
-        )
-
-    def test_tumor_ce_weight_emphasizes_tumor_error(self):
-        logits = torch.tensor(
-            [[[[4.0, 4.0]], [[-4.0, -4.0]]]], dtype=torch.float32
-        )
-        target = torch.tensor([[[0, 1]]], dtype=torch.long)
-        _, unweighted = segmentation_loss(logits, target, tumor_ce_weight=1.0)
-        _, weighted = segmentation_loss(logits, target, tumor_ce_weight=1.5)
-        self.assertGreater(
-            float(weighted["cross_entropy"]),
-            float(unweighted["cross_entropy"]),
         )
 
 
