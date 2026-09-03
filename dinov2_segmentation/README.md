@@ -42,6 +42,22 @@
   --output manifests/train.csv
 ```
 
+## 原始宫颈数据下载
+
+S-BIAD1168 使用可断点续传和按清单字节数校验的下载器。监督脚本会在临时网络错误后自动
+重试，直至清单内所有文件都通过校验；重复运行不会重新下载完整文件：
+
+```bash
+tmux new-session -d -s cervical_download_priority \
+  /path/to/CerviPath/scripts/run_cervical_download_until_complete.sh
+```
+
+可通过 `CERVICAL_SEGMENT_DATA_DIR` 指定数据根目录，通过
+`CERVICAL_DOWNLOAD_PARALLEL` 调整并发数。上游清单中的大量标注名形如
+`slide-id .geojson`；下载器会对远端空格进行 URL 编码，并在本地规范化为
+`slide-id.geojson`，使其可以与同名 WSI 配对。原始清单只会在新下载结果是有效的非空 JSON
+数组时被原子替换。
+
 ## 训练
 
 从 Stage2 目录运行，并把 Stage2 源码与仓库根目录加入 `PYTHONPATH`：

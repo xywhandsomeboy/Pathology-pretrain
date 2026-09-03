@@ -66,11 +66,35 @@ def _expected_sizes(path: Path) -> dict[str, int]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
         raise TypeError("Download manifest must be a JSON list")
-    return {Path(item["path"]).name: int(item["size"]) for item in payload}
+    expected: dict[str, int] = {}
+    for item in payload:
+        manifest_name = Path(item["path"]).name
+        # S-BIAD1168 has 2,348 entries such as ``slide-id .geojson`` while
+        # the corresponding WSI and metadata use ``slide-id``. Normalize only
+        # whitespace immediately before the final suffix so the downloaded
+        # annotation remains pairable with ``slide-id.isyntax``.
+        parsed_name = Path(manifest_name)
+        name = f"{parsed_name.stem.rstrip()}{parsed_name.suffix}"
+        size = int(item["size"])
+        if name in expected and expected[name] != size:
+            raise ValueError(
+                f"Conflicting manifest sizes after filename normalization: {name}"
+            )
+        expected[name] = size
+    return expected
 
 
 def _is_exact_file(path: Path, expected: dict[str, int]) -> bool:
-    return path.is_file() and path.name in expected and path.stat().st_size == expected[path.name]
+    expected_size = expected.get(path.name)
+    # A zero-byte object can be a complete download when the upstream manifest
+    # itself declares size 0, but it is not usable as a WSI, annotation or
+    # preview image during data preparation.
+    return (
+        path.is_file()
+        and expected_size is not None
+        and expected_size > 0
+        and path.stat().st_size == expected_size
+    )
 
 
 def _metadata_records(path: Path) -> dict[str, dict]:
