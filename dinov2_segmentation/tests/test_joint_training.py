@@ -129,6 +129,29 @@ class JointTrainingTest(unittest.TestCase):
         self.assertAlmostEqual(final[0], 1e-5)
         self.assertAlmostEqual(final[1] / final[0], 2.0)
 
+    def test_phase_scales_can_freeze_and_restore_groups(self):
+        left = nn.Parameter(torch.tensor(1.0))
+        right = nn.Parameter(torch.tensor(1.0))
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": [left], "lr": 1e-4, "phase_scale": 1.0},
+                {"params": [right], "lr": 2e-4, "phase_scale": 1.0},
+            ]
+        )
+        scheduler = WarmupCosineScheduler(
+            optimizer, total_steps=10, warmup_steps=2, min_ratio=0.1
+        )
+        scheduler.set_phase_scales([0.0, 0.5])
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.0)
+        self.assertAlmostEqual(optimizer.param_groups[1]["lr"], 5e-5)
+        scheduler.step()
+        self.assertEqual(optimizer.param_groups[0]["lr"], 0.0)
+        scheduler.set_phase_scales([1.0, 1.0])
+        self.assertAlmostEqual(
+            optimizer.param_groups[1]["lr"] / optimizer.param_groups[0]["lr"],
+            2.0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

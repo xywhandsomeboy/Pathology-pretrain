@@ -155,6 +155,7 @@ def build_joint_adamw(
                 "lr": description["lr"],
                 "weight_decay": description["weight_decay"],
                 "group_name": description["name"],
+                "phase_scale": 1.0,
             }
         )
         metadata.append(description)
@@ -184,6 +185,10 @@ class WarmupCosineScheduler:
         self.warmup_steps = int(warmup_steps)
         self.min_ratio = float(min_ratio)
         self.base_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self.phase_scales = [
+            float(group.get("phase_scale", 1.0))
+            for group in optimizer.param_groups
+        ]
         self.current_step = 0
         self._apply()
 
@@ -200,8 +205,22 @@ class WarmupCosineScheduler:
 
     def _apply(self) -> None:
         factor = self._factor()
-        for group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
-            group["lr"] = base_lr * factor
+        for group, base_lr, phase_scale in zip(
+            self.optimizer.param_groups, self.base_lrs, self.phase_scales
+        ):
+            group["phase_scale"] = phase_scale
+            group["lr"] = base_lr * factor * phase_scale
+
+    def set_phase_scales(self, scales: list[float]) -> None:
+        """Apply per-group multipliers without disturbing cosine progress."""
+
+        if len(scales) != len(self.base_lrs):
+            raise ValueError("Phase-scale parameter-group count differs")
+        normalized = list(map(float, scales))
+        if any(not 0 <= scale <= 1 for scale in normalized):
+            raise ValueError("Phase scales must be in [0,1]")
+        self.phase_scales = normalized
+        self._apply()
 
     def step(self) -> None:
         self.current_step = min(self.current_step + 1, self.total_steps - 1)
@@ -213,6 +232,7 @@ class WarmupCosineScheduler:
             "warmup_steps": self.warmup_steps,
             "min_ratio": self.min_ratio,
             "base_lrs": list(self.base_lrs),
+            "phase_scales": list(self.phase_scales),
             "current_step": self.current_step,
         }
 
@@ -226,5 +246,11 @@ class WarmupCosineScheduler:
         if len(loaded_lrs) != len(self.base_lrs):
             raise ValueError("Scheduler parameter-group count differs from checkpoint")
         self.base_lrs = loaded_lrs
+        loaded_scales = list(
+            map(float, state.get("phase_scales", [1.0] * len(self.base_lrs)))
+        )
+        if len(loaded_scales) != len(self.base_lrs):
+            raise ValueError("Scheduler phase-scale group count differs from checkpoint")
+        self.phase_scales = loaded_scales
         self.current_step = int(state["current_step"])
         self._apply()

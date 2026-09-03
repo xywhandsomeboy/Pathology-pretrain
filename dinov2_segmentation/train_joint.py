@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import time
 
 import numpy as np
@@ -19,6 +20,7 @@ from dinov2_segmentation.joint_graph import JointGraphRepository
 from dinov2_segmentation.joint_model import JointSegmentationSystem
 from dinov2_segmentation.joint_optim import (
     WarmupCosineScheduler,
+    _vit_blocks,
     build_joint_adamw,
 )
 from dinov2_segmentation.losses import segmentation_loss
@@ -28,6 +30,7 @@ PAPER_REFERENCES = {
     "adamw": "https://arxiv.org/abs/1711.05101",
     "cosine_schedule": "https://arxiv.org/abs/1608.03983",
     "layerwise_lr_decay": "https://arxiv.org/abs/2106.08254",
+    "gradual_unfreezing": "https://arxiv.org/abs/1801.06146",
     "dinov2": "https://arxiv.org/abs/2304.07193",
     "gatv2": "https://arxiv.org/abs/2105.14491",
     "dense_prediction_adapter": "https://arxiv.org/abs/2205.08534",
@@ -76,6 +79,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gradient-audit-updates", type=int, default=10)
     parser.add_argument("--max-train-batches", type=int, default=0)
     parser.add_argument("--max-val-batches", type=int, default=0)
+    parser.add_argument(
+        "--decoder-only-epochs",
+        type=int,
+        default=0,
+        help="Train only the decoder for this many initial epochs",
+    )
+    parser.add_argument(
+        "--stage1-top-unfreeze-epoch",
+        type=int,
+        default=0,
+        help="Epoch at which selected top DINO blocks begin joint training",
+    )
+    parser.add_argument(
+        "--stage1-unfreeze-blocks",
+        type=int,
+        default=0,
+        help="Number of top DINO blocks to unfreeze; zero means all blocks",
+    )
+    parser.add_argument(
+        "--final-phase-pretrained-lr-scale",
+        type=float,
+        default=1.0,
+        help="LR multiplier for Stage1 fusion and Stage2 after DINO unfreezing",
+    )
+    parser.add_argument(
+        "--final-phase-decoder-lr-scale",
+        type=float,
+        default=1.0,
+        help="Decoder LR multiplier after DINO unfreezing",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=0,
+        help="Stop after this many non-improving validation epochs; zero disables",
+    )
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument(
+        "--early-stopping-start-epoch",
+        type=int,
+        default=0,
+        help="Do not count early-stopping patience before this zero-based epoch",
+    )
     return parser.parse_args()
 
 
@@ -120,6 +166,124 @@ def _gradient_norm(module: torch.nn.Module) -> float:
     if not squares:
         return 0.0
     return float(torch.stack(squares).sum().sqrt().cpu())
+
+
+_BACKBONE_GROUP = re.compile(r"^stage1_backbone_layer_(\d+)_")
+
+
+def _training_phase(
+    system: JointSegmentationSystem,
+    optimizer: torch.optim.Optimizer,
+    scheduler: WarmupCosineScheduler,
+    epoch: int,
+    args: argparse.Namespace,
+) -> dict:
+    """Configure gradual unfreezing and phase-specific LR multipliers."""
+
+    if epoch < args.decoder_only_epochs:
+        phase_name = "decoder_only"
+    elif epoch < args.stage1_top_unfreeze_epoch:
+        phase_name = "adapters_and_decoder"
+    else:
+        phase_name = "top_backbone_joint"
+
+    backbone_layers = [
+        int(match.group(1))
+        for group in optimizer.param_groups
+        if (match := _BACKBONE_GROUP.match(str(group.get("group_name", ""))))
+    ]
+    final_layer = max(backbone_layers, default=0)
+    if args.stage1_unfreeze_blocks > 0:
+        first_enabled_backbone_layer = max(
+            1, final_layer - args.stage1_unfreeze_blocks
+        )
+    else:
+        first_enabled_backbone_layer = 0
+
+    scales = []
+    active_groups = []
+    for group in optimizer.param_groups:
+        name = str(group.get("group_name", ""))
+        match = _BACKBONE_GROUP.match(name)
+        if name.startswith("decoder_"):
+            active = True
+            scale = (
+                args.final_phase_decoder_lr_scale
+                if phase_name == "top_backbone_joint"
+                else 1.0
+            )
+        elif name.startswith("stage2_") or (
+            name.startswith("stage1_") and match is None
+        ):
+            active = phase_name != "decoder_only"
+            scale = (
+                args.final_phase_pretrained_lr_scale
+                if phase_name == "top_backbone_joint"
+                else 1.0
+            )
+        elif match is not None:
+            layer_id = int(match.group(1))
+            active = phase_name == "top_backbone_joint" and (
+                first_enabled_backbone_layer == 0
+                or layer_id >= first_enabled_backbone_layer
+            )
+            scale = 1.0
+        else:
+            raise RuntimeError(f"Unrecognized optimizer group: {name}")
+        effective_scale = scale if active else 0.0
+        scales.append(effective_scale)
+        for parameter in group["params"]:
+            parameter.requires_grad_(active)
+        if active:
+            active_groups.append(name)
+    scheduler.set_phase_scales(scales)
+
+    phase = {
+        "name": phase_name,
+        "epoch": epoch,
+        "active_optimizer_groups": len(active_groups),
+        "total_optimizer_groups": len(optimizer.param_groups),
+        "first_enabled_backbone_layer": (
+            first_enabled_backbone_layer
+            if phase_name == "top_backbone_joint"
+            else None
+        ),
+        "stage1_unfreeze_blocks": (
+            args.stage1_unfreeze_blocks
+            if phase_name == "top_backbone_joint"
+            else 0
+        ),
+    }
+    return phase
+
+
+def _set_runtime_modes(
+    system: JointSegmentationSystem,
+    *,
+    training: bool,
+    phase: dict | None,
+) -> None:
+    system.train(training)
+    if not training or phase is None:
+        return
+    if phase["name"] == "decoder_only":
+        system.stage1.eval()
+        system.stage2.eval()
+        system.decoder.train(True)
+        return
+    if phase["name"] == "adapters_and_decoder":
+        system.stage1.backbone.eval()
+        system.stage2.train(True)
+        return
+
+    # Keep frozen lower ViT blocks deterministic while the selected top blocks
+    # use their normal train-time behavior.
+    system.stage1.backbone.eval()
+    unfreeze_blocks = int(phase["stage1_unfreeze_blocks"])
+    blocks = _vit_blocks(system.stage1.backbone)
+    selected = blocks if unfreeze_blocks == 0 else blocks[-unfreeze_blocks:]
+    for block in selected:
+        block.train(True)
 
 
 def _confusion_update(
@@ -167,9 +331,10 @@ def _run_epoch(
     scheduler=None,
     scaler=None,
     gradient_audit: dict | None = None,
+    training_phase: dict | None = None,
 ) -> dict:
     training = optimizer is not None
-    system.train(training)
+    _set_runtime_modes(system, training=training, phase=training_phase)
     totals = {"loss": 0.0, "cross_entropy": 0.0, "dice_loss": 0.0}
     confusion = torch.zeros((args.num_classes, args.num_classes), dtype=torch.int64)
     samples = 0
@@ -223,28 +388,50 @@ def _run_epoch(
                 for parameter in system.parameters():
                     if parameter.grad is not None:
                         parameter.grad.div_(micro_count)
-                if gradient_audit is not None and not gradient_audit.get("complete", False):
+                audit_enabled = (
+                    gradient_audit is not None
+                    and training_phase is not None
+                    and training_phase["name"] != "decoder_only"
+                )
+                if audit_enabled and not gradient_audit.get("complete", False):
                     observed = {
                         "stage1_grad_norm": _gradient_norm(system.stage1),
                         "stage2_grad_norm": _gradient_norm(system.stage2),
                         "decoder_grad_norm": _gradient_norm(system.decoder),
                     }
+                    full_joint_phase = (
+                        training_phase["name"] == "top_backbone_joint"
+                    )
+                    if full_joint_phase:
+                        observed["stage1_backbone_grad_norm"] = _gradient_norm(
+                            system.stage1.backbone
+                        )
                     gradient_audit["updates_observed"] = int(
                         gradient_audit.get("updates_observed", 0)
                     ) + 1
+                    if full_joint_phase:
+                        gradient_audit["full_joint_updates_observed"] = int(
+                            gradient_audit.get("full_joint_updates_observed", 0)
+                        ) + 1
                     for name, value in observed.items():
                         gradient_audit[name] = max(
                             float(gradient_audit.get(name, 0.0)), float(value)
                         )
-                    stage_keys = tuple(observed)
+                    stage_keys = (
+                        "stage1_grad_norm",
+                        "stage2_grad_norm",
+                        "decoder_grad_norm",
+                        "stage1_backbone_grad_norm",
+                    )
                     gradient_audit["complete"] = all(
-                        math.isfinite(float(gradient_audit[name]))
-                        and float(gradient_audit[name]) > 0
+                        math.isfinite(float(gradient_audit.get(name, 0.0)))
+                        and float(gradient_audit.get(name, 0.0)) > 0
                         for name in stage_keys
                     )
                     if (
                         not gradient_audit["complete"]
-                        and gradient_audit["updates_observed"]
+                        and full_joint_phase
+                        and gradient_audit["full_joint_updates_observed"]
                         >= args.gradient_audit_updates
                     ):
                         raise RuntimeError(
@@ -316,6 +503,14 @@ def _configuration(args: argparse.Namespace) -> dict:
         "amp_dtype",
         "seed",
         "gradient_audit_updates",
+        "decoder_only_epochs",
+        "stage1_top_unfreeze_epoch",
+        "stage1_unfreeze_blocks",
+        "final_phase_pretrained_lr_scale",
+        "final_phase_decoder_lr_scale",
+        "early_stopping_patience",
+        "early_stopping_min_delta",
+        "early_stopping_start_epoch",
     )
     return {key: getattr(args, key) for key in keys}
 
@@ -349,6 +544,24 @@ def main() -> None:
         )
     if not 0 <= args.warmup_ratio < 1:
         raise ValueError("warmup-ratio must be in [0,1)")
+    if not 0 <= args.decoder_only_epochs <= args.stage1_top_unfreeze_epoch < args.epochs:
+        raise ValueError(
+            "Require 0 <= decoder-only-epochs <= stage1-top-unfreeze-epoch < epochs"
+        )
+    if args.stage1_unfreeze_blocks < 0:
+        raise ValueError("stage1-unfreeze-blocks must be non-negative")
+    for name in (
+        "final_phase_pretrained_lr_scale",
+        "final_phase_decoder_lr_scale",
+    ):
+        if not 0 < getattr(args, name) <= 1:
+            raise ValueError(f"{name.replace('_', '-')} must be in (0,1]")
+    if (
+        args.early_stopping_patience < 0
+        or args.early_stopping_min_delta < 0
+        or args.early_stopping_start_epoch < 0
+    ):
+        raise ValueError("Early-stopping settings must be non-negative")
 
     _set_seed(args.seed)
     torch.set_float32_matmul_precision("high")
@@ -425,6 +638,18 @@ def main() -> None:
             "warmup_steps": warmup_steps,
             "minimum_lr_ratio": args.min_lr_ratio,
         },
+        "gradual_unfreezing": {
+            "decoder_only_epochs": args.decoder_only_epochs,
+            "stage1_top_unfreeze_epoch": args.stage1_top_unfreeze_epoch,
+            "stage1_unfreeze_blocks": args.stage1_unfreeze_blocks,
+            "final_phase_pretrained_lr_scale": args.final_phase_pretrained_lr_scale,
+            "final_phase_decoder_lr_scale": args.final_phase_decoder_lr_scale,
+        },
+        "early_stopping": {
+            "patience": args.early_stopping_patience,
+            "minimum_delta": args.early_stopping_min_delta,
+            "start_epoch": args.early_stopping_start_epoch,
+        },
         "paper_references": PAPER_REFERENCES,
     }
     (args.output_dir / "run_manifest.json").write_text(
@@ -437,6 +662,8 @@ def main() -> None:
     history_path = args.output_dir / "history.json"
     history: list[dict] = []
     gradient_audit: dict = {}
+    early_stopping_best = -1.0
+    epochs_without_improvement = 0
     if args.resume is not None:
         checkpoint = _load(args.resume)
         if checkpoint.get("model_version") != system.model_version:
@@ -450,6 +677,12 @@ def main() -> None:
         start_epoch = int(checkpoint["epoch"]) + 1
         best_dice = float(checkpoint.get("best_dice", best_dice))
         gradient_audit.update(checkpoint.get("gradient_audit", {}))
+        early_stopping_best = float(
+            checkpoint.get("early_stopping_best", best_dice)
+        )
+        epochs_without_improvement = int(
+            checkpoint.get("epochs_without_improvement", 0)
+        )
         if history_path.is_file():
             history = [
                 record
@@ -458,6 +691,21 @@ def main() -> None:
             ]
 
     for epoch in range(start_epoch, args.epochs):
+        phase = _training_phase(system, optimizer, scheduler, epoch, args)
+        print(
+            json.dumps(
+                {
+                    "training_phase": phase,
+                    "active_lr_min": min(
+                        group["lr"]
+                        for group in optimizer.param_groups
+                        if group["lr"] > 0
+                    ),
+                    "active_lr_max": max(group["lr"] for group in optimizer.param_groups),
+                }
+            ),
+            flush=True,
+        )
         train_metrics = _run_epoch(
             system,
             train_graphs,
@@ -468,6 +716,7 @@ def main() -> None:
             scheduler=scheduler,
             scaler=scaler,
             gradient_audit=gradient_audit,
+            training_phase=phase,
         )
         with torch.no_grad():
             val_metrics = _run_epoch(
@@ -483,11 +732,28 @@ def main() -> None:
             "val": val_metrics,
             "lr_min": min(group["lr"] for group in optimizer.param_groups),
             "lr_max": max(group["lr"] for group in optimizer.param_groups),
+            "training_phase": phase["name"],
         }
         history.append(record)
         print(json.dumps(record, ensure_ascii=False), flush=True)
         improved = val_metrics["tumor_dice"] > best_dice
         best_dice = max(best_dice, val_metrics["tumor_dice"])
+        should_check_early_stopping = (
+            args.early_stopping_patience > 0
+            and epoch >= args.early_stopping_start_epoch
+        )
+        early_stopping_improved = (
+            val_metrics["tumor_dice"]
+            > early_stopping_best + args.early_stopping_min_delta
+        )
+        if should_check_early_stopping:
+            if early_stopping_improved:
+                early_stopping_best = val_metrics["tumor_dice"]
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+        elif val_metrics["tumor_dice"] > early_stopping_best:
+            early_stopping_best = val_metrics["tumor_dice"]
         state = {
             "format_version": 1,
             "model_version": system.model_version,
@@ -499,6 +765,8 @@ def main() -> None:
             "best_dice": best_dice,
             "configuration": _configuration(args),
             "gradient_audit": gradient_audit,
+            "early_stopping_best": early_stopping_best,
+            "epochs_without_improvement": epochs_without_improvement,
             "run_manifest": run_manifest,
         }
         _atomic_torch_save(state, last_checkpoint)
@@ -511,10 +779,49 @@ def main() -> None:
         (args.output_dir / "gradient_audit.json").write_text(
             json.dumps(gradient_audit, indent=2) + "\n", encoding="utf-8"
         )
+        if (
+            should_check_early_stopping
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            early_stopping = {
+                "stopped_early": True,
+                "stop_epoch": epoch,
+                "best_dice": best_dice,
+                "reference_dice": early_stopping_best,
+                "epochs_without_improvement": epochs_without_improvement,
+                "patience": args.early_stopping_patience,
+                "minimum_delta": args.early_stopping_min_delta,
+                "start_epoch": args.early_stopping_start_epoch,
+            }
+            (args.output_dir / "early_stopping.json").write_text(
+                json.dumps(early_stopping, indent=2) + "\n", encoding="utf-8"
+            )
+            print(json.dumps({"early_stopping": early_stopping}), flush=True)
+            break
     if not gradient_audit.get("complete", False):
         raise RuntimeError(
-            "Joint training ended before Stage1, Stage2 and decoder all received "
+            "Joint training ended before the Stage1 DINO backbone, Stage1 fusion, "
+            "Stage2 and decoder all received "
             f"a non-zero supervised gradient: {gradient_audit}"
+        )
+    early_stopping_path = args.output_dir / "early_stopping.json"
+    if not early_stopping_path.exists():
+        early_stopping_path.write_text(
+            json.dumps(
+                {
+                    "stopped_early": False,
+                    "stop_epoch": history[-1]["epoch"],
+                    "best_dice": best_dice,
+                    "reference_dice": early_stopping_best,
+                    "epochs_without_improvement": epochs_without_improvement,
+                    "patience": args.early_stopping_patience,
+                    "minimum_delta": args.early_stopping_min_delta,
+                    "start_epoch": args.early_stopping_start_epoch,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
         )
     complete_path.touch()
 

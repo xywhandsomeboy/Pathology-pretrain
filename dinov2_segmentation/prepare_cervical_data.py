@@ -9,6 +9,7 @@ closed so a new source label can never be silently assigned to the wrong class.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import csv
 import hashlib
 import json
@@ -463,9 +464,27 @@ def prepare(args) -> dict:
 
     expected = _expected_sizes(args.download_manifest)
     rows = []
-    for index, record in enumerate(records, start=1):
-        print(f"[{index}/{len(records)}] preparing {record['slide_id']}", flush=True)
-        rows.extend(_process_slide(record, args, expected))
+    if args.workers == 1:
+        for index, record in enumerate(records, start=1):
+            print(f"[{index}/{len(records)}] preparing {record['slide_id']}", flush=True)
+            rows.extend(_process_slide(record, args, expected))
+    else:
+        print(
+            f"Preparing {len(records)} slides with {args.workers} worker processes",
+            flush=True,
+        )
+        with ProcessPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(_process_slide, record, args, expected): record["slide_id"]
+                for record in records
+            }
+            for index, future in enumerate(as_completed(futures), start=1):
+                slide_id = futures[future]
+                rows.extend(future.result())
+                print(
+                    f"[{index}/{len(records)}] prepared {slide_id}",
+                    flush=True,
+                )
     rows.sort(key=lambda row: (row["slide_id"], int(row["y"]), int(row["x"])))
     _atomic_csv(args.output_root / "all_patches.csv", rows)
     for split in ("train", "valid", "test"):
@@ -503,6 +522,7 @@ def parse_args():
             child.add_argument("--minimum-tissue-fraction", type=float, default=0.2)
             child.add_argument("--selection-seed", type=int, default=42)
             child.add_argument("--negative-ratio", type=int, default=3)
+            child.add_argument("--workers", type=int, default=1)
     return parser.parse_args()
 
 
@@ -515,6 +535,8 @@ def main() -> None:
         print(json.dumps(status, ensure_ascii=False, sort_keys=True))
         raise SystemExit(0 if status["ready"] else 3)
     args.output_root = args.output_root.expanduser().resolve()
+    if args.workers < 1:
+        raise ValueError("workers must be positive")
     print(json.dumps(prepare(args), ensure_ascii=False, sort_keys=True))
 
 

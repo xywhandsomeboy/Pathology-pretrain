@@ -19,10 +19,32 @@ gpu_threshold_mb="${GPU_BUSY_THRESHOLD_MB:-4096}"
 stage1_batch="${STAGE1_BATCH_SIZE:-64}"
 stage1_workers="${STAGE1_WORKERS:-8}"
 decoder_epochs="${DECODER_EPOCHS:-50}"
-decoder_workers="${DECODER_WORKERS:-4}"
-v1_batch="${V1_BATCH_SIZE:-1}"
-v2_batch="${V2_BATCH_SIZE:-1}"
-joint_accumulation="${JOINT_GRADIENT_ACCUMULATION:-8}"
+decoder_workers="${DECODER_WORKERS:-8}"
+prepare_workers="${PREPARE_WORKERS:-4}"
+v1_batch="${V1_BATCH_SIZE:-16}"
+v2_batch="${V2_BATCH_SIZE:-16}"
+joint_accumulation="${JOINT_GRADIENT_ACCUMULATION:-1}"
+decoder_only_epochs="${DECODER_ONLY_EPOCHS:-3}"
+stage1_top_unfreeze_epoch="${STAGE1_TOP_UNFREEZE_EPOCH:-8}"
+stage1_unfreeze_blocks="${STAGE1_UNFREEZE_BLOCKS:-4}"
+early_stopping_patience="${EARLY_STOPPING_PATIENCE:-3}"
+early_stopping_start_epoch="${EARLY_STOPPING_START_EPOCH:-12}"
+early_stopping_min_delta="${EARLY_STOPPING_MIN_DELTA:-0.001}"
+joint_variants_raw="${JOINT_VARIANTS:-baseline distance_only weighted_pretrain_distance_context}"
+read -r -a joint_variants <<< "${joint_variants_raw}"
+(( ${#joint_variants[@]} > 0 )) || {
+  echo "JOINT_VARIANTS must select at least one Stage2 variant." >&2
+  exit 1
+}
+for variant in "${joint_variants[@]}"; do
+  case "${variant}" in
+    baseline|distance_only|weighted_pretrain_distance_context) ;;
+    *)
+      echo "Unsupported Stage2 variant in JOINT_VARIANTS: ${variant}" >&2
+      exit 1
+      ;;
+  esac
+done
 
 stage1_dir="${repo_dir}/dinov2_stage1_Extract2s2"
 stage2_dir="${repo_dir}/dinov2_stage2_2_FmH2ST"
@@ -120,6 +142,7 @@ log "Partial-data threshold reached; freezing the currently complete annotated c
   --minimum-tissue-fraction 0.2 \
   --selection-seed 42 \
   --negative-ratio 3 \
+  --workers "${prepare_workers}" \
   2>&1 | tee -a "${logs_dir}/prepare_data.log"
 log "WSI patch extraction and binary mask preparation complete"
 
@@ -244,6 +267,17 @@ run_decoder_pair() {
       --num-classes 2 --epochs "${decoder_epochs}" \
       --batch-size "${v1_batch}" --workers "${decoder_workers}" \
       --gradient-accumulation "${joint_accumulation}" \
+      --decoder-lr 1e-4 --stage2-lr 1e-5 \
+      --stage1-fusion-lr 1e-5 --stage1-backbone-lr 2e-6 \
+      --layer-decay 0.8 --warmup-ratio 0.1 --min-lr-ratio 0.01 \
+      --decoder-only-epochs "${decoder_only_epochs}" \
+      --stage1-top-unfreeze-epoch "${stage1_top_unfreeze_epoch}" \
+      --stage1-unfreeze-blocks "${stage1_unfreeze_blocks}" \
+      --final-phase-pretrained-lr-scale 0.5 \
+      --final-phase-decoder-lr-scale 0.5 \
+      --early-stopping-patience "${early_stopping_patience}" \
+      --early-stopping-start-epoch "${early_stopping_start_epoch}" \
+      --early-stopping-min-delta "${early_stopping_min_delta}" \
       "${v1_resume[@]}"
   ) > "${logs_dir}/decoder_${variant}_v1.log" 2>&1 &
   local pid_v1=$!
@@ -264,6 +298,17 @@ run_decoder_pair() {
       --num-classes 2 --epochs "${decoder_epochs}" \
       --batch-size "${v2_batch}" --workers "${decoder_workers}" \
       --gradient-accumulation "${joint_accumulation}" \
+      --decoder-lr 1e-4 --stage2-lr 1e-5 \
+      --stage1-fusion-lr 1e-5 --stage1-backbone-lr 2e-6 \
+      --layer-decay 0.8 --warmup-ratio 0.1 --min-lr-ratio 0.01 \
+      --decoder-only-epochs "${decoder_only_epochs}" \
+      --stage1-top-unfreeze-epoch "${stage1_top_unfreeze_epoch}" \
+      --stage1-unfreeze-blocks "${stage1_unfreeze_blocks}" \
+      --final-phase-pretrained-lr-scale 0.5 \
+      --final-phase-decoder-lr-scale 0.5 \
+      --early-stopping-patience "${early_stopping_patience}" \
+      --early-stopping-start-epoch "${early_stopping_start_epoch}" \
+      --early-stopping-min-delta "${early_stopping_min_delta}" \
       "${v2_resume[@]}"
   ) > "${logs_dir}/decoder_${variant}_v2.log" 2>&1 &
   local pid_v2=$!
@@ -276,10 +321,15 @@ run_decoder_pair() {
   log "Decoder pair complete: ${variant}"
 }
 
-run_decoder_pair baseline "${graph_dual}"
-run_decoder_pair distance_only "${graph_distance}"
-run_decoder_pair weighted_pretrain_distance_context "${graph_distance}"
-"${python_bin}" - "${work_root}" "${decoder_epochs}" <<'PY'
+for variant in "${joint_variants[@]}"; do
+  case "${variant}" in
+    baseline) run_decoder_pair "${variant}" "${graph_dual}" ;;
+    distance_only|weighted_pretrain_distance_context)
+      run_decoder_pair "${variant}" "${graph_distance}"
+      ;;
+  esac
+done
+"${python_bin}" - "${work_root}" "${decoder_epochs}" "${joint_variants[@]}" <<'PY'
 import json
 import math
 import sys
@@ -287,22 +337,34 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 epochs = int(sys.argv[2])
-variants = ("baseline", "distance_only", "weighted_pretrain_distance_context")
+variants = tuple(sys.argv[3:])
 for variant in variants:
     for decoder in ("v1", "v2"):
         output = root / "decoder_runs" / variant / decoder
-        required = (output / "complete", output / "checkpoint_last.pt", output / "history.json", output / "gradient_audit.json")
+        required = (output / "complete", output / "checkpoint_last.pt", output / "history.json", output / "gradient_audit.json", output / "early_stopping.json")
         missing = [str(path) for path in required if not path.is_file()]
         if missing:
             raise SystemExit(f"Incomplete model {variant}/{decoder}: {missing}")
         history = json.loads((output / "history.json").read_text())
-        if len(history) != epochs or int(history[-1]["epoch"]) != epochs - 1:
+        early_stopping = json.loads((output / "early_stopping.json").read_text())
+        valid_length = (
+            len(history) == epochs and int(history[-1]["epoch"]) == epochs - 1
+        ) or (
+            0 < len(history) < epochs
+            and bool(early_stopping.get("stopped_early"))
+            and int(early_stopping.get("stop_epoch", -1)) == int(history[-1]["epoch"])
+        )
+        if not valid_length:
             raise SystemExit(f"Epoch audit failed for {variant}/{decoder}")
         gradients = json.loads((output / "gradient_audit.json").read_text())
-        expected = ("stage1_grad_norm", "stage2_grad_norm", "decoder_grad_norm")
+        expected = ("stage1_grad_norm", "stage1_backbone_grad_norm", "stage2_grad_norm", "decoder_grad_norm")
         if not all(math.isfinite(float(gradients.get(key, 0))) and float(gradients[key]) > 0 for key in expected):
             raise SystemExit(f"Gradient audit failed for {variant}/{decoder}: {gradients}")
-print("Verified six complete joint models and non-zero Stage1/Stage2/decoder gradients")
+print(f"Verified {len(variants) * 2} complete joint models and non-zero Stage1/Stage2/decoder gradients")
 PY
-touch "${work_root}/six_models.complete"
-log "All six segmentation models completed"
+if (( ${#joint_variants[@]} == 3 )); then
+  touch "${work_root}/six_models.complete"
+else
+  touch "${work_root}/selected_models.complete"
+fi
+log "All $(( ${#joint_variants[@]} * 2 )) selected segmentation models completed"
