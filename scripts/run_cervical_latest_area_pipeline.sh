@@ -25,6 +25,8 @@ env \
   PREPROCESS_ONLY=1 \
   PREPARE_WORKERS="${PREPARE_WORKERS:-6}" \
   STAGE1_GPU_ID="${STAGE1_GPU_ID:-${gpu_id}}" \
+  DATA_SPLIT_MODE="${DATA_SPLIT_MODE:-train_val_80_20}" \
+  VALIDATION_FRACTION="${VALIDATION_FRACTION:-0.2}" \
   JOINT_VARIANTS="${stage2_variant}" \
   bash "${repo_dir}/scripts/run_cervical_six_models.sh"
 

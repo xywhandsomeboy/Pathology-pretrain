@@ -180,6 +180,8 @@ def discover_ready(args) -> tuple[list[dict], dict]:
             {
                 "slide_id": slide_id,
                 "split": split,
+                "source_split": split,
+                "source_category": category,
                 "binary_slide_class": int(category in TUMOR_CATEGORIES),
                 "isyntax_path": str(slide_path.resolve()),
                 "geojson_path": str(annotation_path.resolve()),
@@ -347,7 +349,10 @@ def _process_slide(record: dict, args, expected: dict[str, int]) -> list[dict]:
         if existing.get("source_signature") != source_signature:
             raise ValueError(f"Existing prepared slide uses different settings: {slide_id}")
         with rows_path.open(newline="", encoding="utf-8") as stream:
-            return list(csv.DictReader(stream))
+            rows = list(csv.DictReader(stream))
+        for row in rows:
+            row["split"] = record["split"]
+        return rows
 
     features = _annotation_features(Path(record["geojson_path"]))
     slide_path = Path(record["isyntax_path"])
@@ -423,11 +428,45 @@ def _selection_key(seed: int, patch_id: str) -> str:
     return hashlib.sha256(f"{seed}|{patch_id}".encode()).hexdigest()
 
 
-def _write_selections(rows: list[dict], output_root: Path, seed: int, negative_ratio: int) -> dict:
+def _assign_training_splits(
+    records: list[dict],
+    *,
+    mode: str,
+    validation_fraction: float,
+    seed: int,
+) -> list[dict]:
+    assigned = [dict(record) for record in records]
+    if mode == "official":
+        return assigned
+    if mode != "train_val_80_20":
+        raise ValueError(f"Unsupported split mode: {mode!r}")
+
+    by_class = defaultdict(list)
+    for record in assigned:
+        by_class[int(record["binary_slide_class"])].append(record)
+    for class_records in by_class.values():
+        class_records.sort(key=lambda row: _selection_key(seed, row["slide_id"]))
+        validation_count = round(len(class_records) * validation_fraction)
+        validation_count = min(max(validation_count, 1), len(class_records) - 1)
+        for index, record in enumerate(class_records):
+            record["split"] = "valid" if index < validation_count else "train"
+    return assigned
+
+
+def _write_selections(
+    rows: list[dict],
+    output_root: Path,
+    seed: int,
+    negative_ratio: int,
+    *,
+    include_test: bool = True,
+) -> dict:
     by_split = defaultdict(list)
     for row in rows:
         by_split[row["split"]].append(row)
-    selected = {"valid": by_split["valid"], "test": by_split["test"]}
+    selected = {"valid": by_split["valid"]}
+    if include_test:
+        selected["test"] = by_split["test"]
     by_slide = defaultdict(list)
     for row in by_split["train"]:
         by_slide[row["slide_id"]].append(row)
@@ -446,7 +485,8 @@ def _write_selections(rows: list[dict], output_root: Path, seed: int, negative_r
     selected["train"] = train
     selection_root = output_root / "decoder_selection"
     summary = {}
-    for split in ("train", "valid", "test"):
+    split_names = ("train", "valid", "test") if include_test else ("train", "valid")
+    for split in split_names:
         split_rows = selected[split]
         _atomic_csv(selection_root / f"{split}.csv", split_rows)
         summary[split] = {
@@ -454,6 +494,10 @@ def _write_selections(rows: list[dict], output_root: Path, seed: int, negative_r
             "tumor_patches": sum(int(row["has_tumor"]) for row in split_rows),
             "slides": len({row["slide_id"] for row in split_rows}),
         }
+    if not include_test:
+        stale_test = selection_root / "test.csv"
+        if stale_test.exists():
+            stale_test.unlink()
     _atomic_json(selection_root / "summary.json", summary)
     return summary
 
@@ -492,6 +536,30 @@ def prepare(args) -> dict:
         }
         _atomic_json(cohort_path, cohort)
 
+    records = _assign_training_splits(
+        records,
+        mode=args.split_mode,
+        validation_fraction=args.validation_fraction,
+        seed=args.selection_seed,
+    )
+    cohort["training_split"] = {
+        "mode": args.split_mode,
+        "validation_fraction": args.validation_fraction,
+        "seed": args.selection_seed,
+        "split_counts": dict(Counter(record["split"] for record in records)),
+        "binary_class_split_counts": {
+            str(label): dict(
+                Counter(
+                    record["split"]
+                    for record in records
+                    if int(record["binary_slide_class"]) == label
+                )
+            )
+            for label in (0, 1)
+        },
+    }
+    _atomic_json(cohort_path, cohort)
+
     expected = _expected_sizes(args.download_manifest)
     rows = []
     if args.workers == 1:
@@ -517,12 +585,24 @@ def prepare(args) -> dict:
                 )
     rows.sort(key=lambda row: (row["slide_id"], int(row["y"]), int(row["x"])))
     _atomic_csv(args.output_root / "all_patches.csv", rows)
-    for split in ("train", "valid", "test"):
+    include_test = args.split_mode == "official"
+    split_names = ("train", "valid", "test") if include_test else ("train", "valid")
+    for split in split_names:
         _atomic_csv(
             args.output_root / f"all_patches_{split}.csv",
             [row for row in rows if row["split"] == split],
         )
-    selection = _write_selections(rows, args.output_root, args.selection_seed, args.negative_ratio)
+    if not include_test:
+        stale_test = args.output_root / "all_patches_test.csv"
+        if stale_test.exists():
+            stale_test.unlink()
+    selection = _write_selections(
+        rows,
+        args.output_root,
+        args.selection_seed,
+        args.negative_ratio,
+        include_test=include_test,
+    )
     summary = {
         "slides": len(records),
         "patches": len(rows),
@@ -544,6 +624,12 @@ def parse_args():
         child.add_argument("--minimum-ready", type=int, default=32)
         child.add_argument("--minimum-train", type=int, default=16)
         child.add_argument("--minimum-valid", type=int, default=8)
+        child.add_argument(
+            "--split-mode",
+            choices=("official", "train_val_80_20"),
+            default="official",
+        )
+        child.add_argument("--validation-fraction", type=float, default=0.2)
         if command == "prepare":
             child.add_argument("--output-root", type=Path, required=True)
             child.add_argument("--level", type=int, default=1)
@@ -567,6 +653,8 @@ def main() -> None:
     args.output_root = args.output_root.expanduser().resolve()
     if args.workers < 1:
         raise ValueError("workers must be positive")
+    if not 0.0 < args.validation_fraction < 1.0:
+        raise ValueError("validation-fraction must be in (0,1)")
     print(json.dumps(prepare(args), ensure_ascii=False, sort_keys=True))
 
 

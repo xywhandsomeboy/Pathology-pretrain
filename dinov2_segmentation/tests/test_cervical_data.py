@@ -12,6 +12,7 @@ from openpyxl import Workbook
 
 from dinov2_segmentation.prepare_cervical_data import (
     _annotation_features,
+    _assign_training_splits,
     _binary_mask,
     _is_exact_file,
     _scaled_polygons,
@@ -253,3 +254,29 @@ def test_training_selection_is_deterministic_and_keeps_all_positive(tmp_path):
 
     assert first == second
     assert {row["patch_id"] for row in selected if int(row["has_tumor"])} == {"p0", "p1"}
+
+
+def test_train_val_80_20_split_is_wsi_level_stratified_and_has_no_test():
+    records = [
+        {
+            "slide_id": f"slide-{label}-{index}",
+            "split": "test" if index % 3 == 0 else "train",
+            "binary_slide_class": label,
+        }
+        for label in (0, 1)
+        for index in range(10)
+    ]
+
+    assigned = _assign_training_splits(
+        records,
+        mode="train_val_80_20",
+        validation_fraction=0.2,
+        seed=42,
+    )
+
+    assert {record["split"] for record in assigned} == {"train", "valid"}
+    assert sum(record["split"] == "train" for record in assigned) == 16
+    assert sum(record["split"] == "valid" for record in assigned) == 4
+    for label in (0, 1):
+        class_records = [record for record in assigned if record["binary_slide_class"] == label]
+        assert sum(record["split"] == "valid" for record in class_records) == 2

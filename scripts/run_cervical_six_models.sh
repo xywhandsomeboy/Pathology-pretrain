@@ -23,6 +23,8 @@ decoder_workers="${DECODER_WORKERS:-8}"
 prepare_workers="${PREPARE_WORKERS:-4}"
 preprocess_only="${PREPROCESS_ONLY:-0}"
 stage1_gpu="${STAGE1_GPU_ID:-0}"
+data_split_mode="${DATA_SPLIT_MODE:-official}"
+validation_fraction="${VALIDATION_FRACTION:-0.2}"
 v1_batch="${V1_BATCH_SIZE:-16}"
 v2_batch="${V2_BATCH_SIZE:-16}"
 v1_gpu="${V1_GPU_ID:-0}"
@@ -126,6 +128,8 @@ status_args=(
   --minimum-ready "${minimum_ready}"
   --minimum-train "${minimum_train}"
   --minimum-valid "${minimum_valid}"
+  --split-mode "${data_split_mode}"
+  --validation-fraction "${validation_fraction}"
 )
 
 for required in "${python_bin}" "${download_manifest}" "${metadata_xlsx}" "${selected_stage1_checkpoint}" "${selected_stage1_config}"; do
