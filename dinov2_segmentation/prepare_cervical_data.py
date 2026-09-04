@@ -553,11 +553,20 @@ def prepare(args) -> dict:
         cohort = json.loads(cohort_path.read_text(encoding="utf-8"))
         if cohort.get("config") != cohort_config:
             raise ValueError("Existing frozen cohort uses different preparation settings")
-        by_id = {record["slide_id"]: record for record in ready}
-        missing = sorted(set(cohort["slide_ids"]).difference(by_id))
-        if missing:
-            raise RuntimeError(f"Frozen cohort sources are no longer complete: {missing}")
-        records = [by_id[slide_id] for slide_id in cohort["slide_ids"]]
+        if args.refresh_cohort:
+            records = ready
+            cohort["slide_ids"] = [record["slide_id"] for record in records]
+            cohort["split_counts"] = dict(
+                Counter(record["split"] for record in records)
+            )
+            cohort.pop("excluded_slides", None)
+            cohort.pop("usable_slide_ids", None)
+        else:
+            by_id = {record["slide_id"]: record for record in ready}
+            missing = sorted(set(cohort["slide_ids"]).difference(by_id))
+            if missing:
+                raise RuntimeError(f"Frozen cohort sources are no longer complete: {missing}")
+            records = [by_id[slide_id] for slide_id in cohort["slide_ids"]]
     else:
         records = ready
         cohort = {
@@ -708,6 +717,11 @@ def parse_args():
         )
         child.add_argument("--validation-fraction", type=float, default=0.2)
         if command == "prepare":
+            child.add_argument(
+                "--refresh-cohort",
+                action="store_true",
+                help="Replace a prior frozen cohort with every source ready at startup",
+            )
             child.add_argument("--output-root", type=Path, required=True)
             child.add_argument("--level", type=int, default=1)
             child.add_argument("--patch-size", type=int, default=224)

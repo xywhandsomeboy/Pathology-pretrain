@@ -23,6 +23,7 @@ env \
   CERVICAL_WORK_ROOT="${work_root}" \
   PYTHON_BIN="${python_bin}" \
   PREPROCESS_ONLY=1 \
+  REFRESH_COHORT="${REFRESH_COHORT:-1}" \
   PREPARE_WORKERS="${PREPARE_WORKERS:-6}" \
   STAGE1_GPU_ID="${STAGE1_GPU_ID:-${gpu_id}}" \
   DATA_SPLIT_MODE="${DATA_SPLIT_MODE:-train_val_80_20}" \

@@ -22,6 +22,7 @@ decoder_epochs="${DECODER_EPOCHS:-50}"
 decoder_workers="${DECODER_WORKERS:-8}"
 prepare_workers="${PREPARE_WORKERS:-4}"
 preprocess_only="${PREPROCESS_ONLY:-0}"
+refresh_cohort="${REFRESH_COHORT:-0}"
 stage1_gpu="${STAGE1_GPU_ID:-0}"
 data_split_mode="${DATA_SPLIT_MODE:-official}"
 validation_fraction="${VALIDATION_FRACTION:-0.2}"
@@ -53,6 +54,10 @@ for variant in "${joint_variants[@]}"; do
 done
 [[ "${preprocess_only}" == 0 || "${preprocess_only}" == 1 ]] || {
   echo "PREPROCESS_ONLY must be 0 or 1." >&2
+  exit 1
+}
+[[ "${refresh_cohort}" == 0 || "${refresh_cohort}" == 1 ]] || {
+  echo "REFRESH_COHORT must be 0 or 1." >&2
   exit 1
 }
 [[ "${stage1_gpu}" =~ ^[0-9]+$ ]] || {
@@ -149,8 +154,14 @@ while ! "${python_bin}" -m dinov2_segmentation.prepare_cervical_data status \
 done
 log "Partial-data threshold reached; freezing the currently complete annotated cohort"
 
+refresh_args=()
+if [[ "${refresh_cohort}" == 1 ]]; then
+  refresh_args+=(--refresh-cohort)
+fi
+
 "${python_bin}" -m dinov2_segmentation.prepare_cervical_data prepare \
   "${status_args[@]}" \
+  "${refresh_args[@]}" \
   --output-root "${work_root}" \
   --level 1 \
   --patch-size 224 \
