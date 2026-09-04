@@ -340,6 +340,7 @@ class JointSegmentationSystem(nn.Module):
         stage2_config: str | Path,
         stage2_checkpoint: str | Path,
         num_classes: int = 2,
+        decoder_drop_path_rate: float = 0.1,
     ) -> None:
         super().__init__()
         self.stage1 = TrainableStage1(stage1_config, stage1_checkpoint)
@@ -351,12 +352,14 @@ class JointSegmentationSystem(nn.Module):
                 num_classes=num_classes,
                 token_dim=self.stage1.embed_dim,
                 context_dim=self.stage1.embed_dim,
+                drop_path_rate=decoder_drop_path_rate,
             )
         elif decoder_version == "v2":
             self.decoder = GlobalLocalSegmentationModelV2(
                 num_classes=num_classes,
                 token_dim=self.stage1.embed_dim,
                 context_dim=self.stage1.embed_dim,
+                drop_path_rate=decoder_drop_path_rate,
             )
         else:
             raise ValueError("decoder_version must be 'v1' or 'v2'")

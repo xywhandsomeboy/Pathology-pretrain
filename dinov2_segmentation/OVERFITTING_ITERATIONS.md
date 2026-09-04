@@ -55,3 +55,22 @@ soft Dice                  = unchanged
   与细胞核分割中用于提升染色变化下的泛化：<https://arxiv.org/abs/2206.12694>。
 - 再下一项候选为按 WSI 平衡采样，减小单张大切片对梯度的支配；不得与染色增强在同一
   首次试验中同时启用，以保留消融可解释性。
+
+## Iteration 2：提高 Decoder stochastic depth
+
+### 触发证据
+
+采用 WSI 平衡采样的 S、ST、STA 三个版本均在 epoch 1 达到最佳验证 Dice（分别为
+0.7861、0.7865、0.7873），之后训练 Dice 持续上升至约 0.959，而 epoch 5 验证 Dice
+下降至 0.758–0.761、验证 loss 上升至 0.897–0.999。退化在 epoch 2 的
+`decoder_only` 阶段已经开始，因此不能归因于 Stage1/Stage2 解冻。
+
+### 本轮单变量修改
+
+将 Decoder 内残差块的最大 stochastic-depth 概率从 `0.1` 提高到 `0.2`。采样策略、
+S/ST/STA 损失定义、颜色增强、AdamW、各参数组学习率、warm-up/cosine 调度和解冻时刻
+全部保持不变。新实验使用 `v1_dp020` 输出目录，不覆盖已终止实验及其最佳权重。
+
+Stochastic Depth 在训练时随机绕过残差分支、推理时使用完整网络，用于正则化深层残差
+网络：<https://arxiv.org/abs/1603.09382>。现有 AdamW 与 cosine 调度分别继续依据
+<https://arxiv.org/abs/1711.05101> 和 <https://arxiv.org/abs/1608.03983>。

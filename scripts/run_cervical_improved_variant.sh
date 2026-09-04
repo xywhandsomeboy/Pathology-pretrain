@@ -66,10 +66,12 @@ work_root="${CERVICAL_WORK_ROOT:-${repo_dir}/Data/cervical_segmentation_expanded
 stage1_root="${repo_dir}/dinov2_stage1_Extract2s2/dinov2/results/stage1a_spatial_fusion_cosine200_e800_minlr1e-8"
 stage2_root="${repo_dir}/dinov2_stage2_2_FmH2ST/dinov2/results/stage2_variants/${stage2_variant}/${stage2_run_id}"
 stage2_source="${repo_dir}/dinov2_stage2_2_FmH2ST"
-output_dir="${IMPROVED_OUTPUT_ROOT:-${work_root}/decoder_runs_improved}/${profile}/${stage2_variant}/${decoder_version}"
 epochs="${DECODER_EPOCHS:-50}"
 batch_size="${BATCH_SIZE:-16}"
 workers="${DECODER_WORKERS:-8}"
+decoder_drop_path_rate="${DECODER_DROP_PATH_RATE:-0.1}"
+run_suffix="${RUN_SUFFIX:-}"
+output_dir="${IMPROVED_OUTPUT_ROOT:-${work_root}/decoder_runs_improved}/${profile}/${stage2_variant}/${decoder_version}${run_suffix}"
 
 required=(
   "${python_bin}"
@@ -111,6 +113,7 @@ command=(
   "${python_bin}" -m dinov2_segmentation.train_joint
   --experiment-profile "${profile}"
   --decoder-version "${decoder_version}"
+  --decoder-drop-path-rate "${decoder_drop_path_rate}"
   --train-manifest "${work_root}/decoder_selection/train.csv"
   --val-manifest "${work_root}/decoder_selection/valid.csv"
   --graph-dir "${work_root}/graphs/${graph_name}"

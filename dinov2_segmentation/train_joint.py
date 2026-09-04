@@ -56,6 +56,12 @@ def _load(path: str | Path):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--decoder-version", choices=("v1", "v2"), required=True)
+    parser.add_argument(
+        "--decoder-drop-path-rate",
+        type=float,
+        default=0.1,
+        help="Maximum stochastic-depth probability inside the decoder",
+    )
     parser.add_argument("--train-manifest", type=Path, required=True)
     parser.add_argument("--val-manifest", type=Path, required=True)
     parser.add_argument("--graph-dir", type=Path, required=True)
@@ -582,6 +588,7 @@ def _configuration(args: argparse.Namespace) -> dict:
     keys = (
         "experiment_profile",
         "decoder_version",
+        "decoder_drop_path_rate",
         "num_classes",
         "image_size",
         "epochs",
@@ -631,6 +638,8 @@ def main() -> None:
     args = parse_args()
     if args.num_classes != 2:
         raise ValueError("The cervical workflow requires binary background/tumor output")
+    if not 0.0 <= args.decoder_drop_path_rate < 1.0:
+        raise ValueError("decoder-drop-path-rate must be in [0, 1)")
     for name in (
         "train_manifest",
         "val_manifest",
@@ -720,6 +729,7 @@ def main() -> None:
         stage2_config=args.stage2_config,
         stage2_checkpoint=args.stage2_checkpoint,
         num_classes=args.num_classes,
+        decoder_drop_path_rate=args.decoder_drop_path_rate,
     ).to(device)
     optimizer, group_metadata = build_joint_adamw(
         system,
