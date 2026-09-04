@@ -43,6 +43,10 @@ PATCH_FIELDS = (
 )
 
 
+class NoUsablePatchesError(ValueError):
+    """Raised when a source WSI cannot contribute any training patches."""
+
+
 def _atomic_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -411,7 +415,9 @@ def _process_slide(record: dict, args, expected: dict[str, int]) -> list[dict]:
                     }
                 )
     if not rows:
-        raise ValueError(f"Tissue screening produced no patches for {slide_id}")
+        raise NoUsablePatchesError(
+            f"Tissue screening produced no patches for {slide_id}"
+        )
     _atomic_csv(rows_path, rows)
     _atomic_json(
         marker_path,
@@ -451,6 +457,31 @@ def _assign_training_splits(
         for index, record in enumerate(class_records):
             record["split"] = "valid" if index < validation_count else "train"
     return assigned
+
+
+def _training_split_summary(
+    records: list[dict],
+    *,
+    mode: str,
+    validation_fraction: float,
+    seed: int,
+) -> dict:
+    return {
+        "mode": mode,
+        "validation_fraction": validation_fraction,
+        "seed": seed,
+        "split_counts": dict(Counter(record["split"] for record in records)),
+        "binary_class_split_counts": {
+            str(label): dict(
+                Counter(
+                    record["split"]
+                    for record in records
+                    if int(record["binary_slide_class"]) == label
+                )
+            )
+            for label in (0, 1)
+        },
+    }
 
 
 def _write_selections(
@@ -536,36 +567,40 @@ def prepare(args) -> dict:
         }
         _atomic_json(cohort_path, cohort)
 
+    known_exclusions = {
+        item["slide_id"]: item for item in cohort.get("excluded_slides", [])
+    }
+    records = [
+        record for record in records if record["slide_id"] not in known_exclusions
+    ]
     records = _assign_training_splits(
         records,
         mode=args.split_mode,
         validation_fraction=args.validation_fraction,
         seed=args.selection_seed,
     )
-    cohort["training_split"] = {
-        "mode": args.split_mode,
-        "validation_fraction": args.validation_fraction,
-        "seed": args.selection_seed,
-        "split_counts": dict(Counter(record["split"] for record in records)),
-        "binary_class_split_counts": {
-            str(label): dict(
-                Counter(
-                    record["split"]
-                    for record in records
-                    if int(record["binary_slide_class"]) == label
-                )
-            )
-            for label in (0, 1)
-        },
-    }
+    cohort["training_split"] = _training_split_summary(
+        records,
+        mode=args.split_mode,
+        validation_fraction=args.validation_fraction,
+        seed=args.selection_seed,
+    )
     _atomic_json(cohort_path, cohort)
 
     expected = _expected_sizes(args.download_manifest)
     rows = []
+    new_exclusions: dict[str, dict] = {}
     if args.workers == 1:
         for index, record in enumerate(records, start=1):
             print(f"[{index}/{len(records)}] preparing {record['slide_id']}", flush=True)
-            rows.extend(_process_slide(record, args, expected))
+            try:
+                rows.extend(_process_slide(record, args, expected))
+            except NoUsablePatchesError as error:
+                new_exclusions[record["slide_id"]] = {
+                    "slide_id": record["slide_id"],
+                    "reason": str(error),
+                }
+                print(f"[{index}/{len(records)}] excluded {record['slide_id']}: {error}", flush=True)
     else:
         print(
             f"Preparing {len(records)} slides with {args.workers} worker processes",
@@ -573,16 +608,57 @@ def prepare(args) -> dict:
         )
         with ProcessPoolExecutor(max_workers=args.workers) as executor:
             futures = {
-                executor.submit(_process_slide, record, args, expected): record["slide_id"]
+                executor.submit(_process_slide, record, args, expected): record
                 for record in records
             }
             for index, future in enumerate(as_completed(futures), start=1):
-                slide_id = futures[future]
-                rows.extend(future.result())
+                record = futures[future]
+                slide_id = record["slide_id"]
+                try:
+                    rows.extend(future.result())
+                except NoUsablePatchesError as error:
+                    new_exclusions[slide_id] = {
+                        "slide_id": slide_id,
+                        "reason": str(error),
+                    }
+                    print(
+                        f"[{index}/{len(records)}] excluded {slide_id}: {error}",
+                        flush=True,
+                    )
+                    continue
                 print(
                     f"[{index}/{len(records)}] prepared {slide_id}",
                     flush=True,
                 )
+
+    if new_exclusions:
+        known_exclusions.update(new_exclusions)
+        records = [
+            record for record in records if record["slide_id"] not in new_exclusions
+        ]
+        records = _assign_training_splits(
+            records,
+            mode=args.split_mode,
+            validation_fraction=args.validation_fraction,
+            seed=args.selection_seed,
+        )
+        split_by_slide = {
+            record["slide_id"]: record["split"] for record in records
+        }
+        for row in rows:
+            row["split"] = split_by_slide[row["slide_id"]]
+
+    cohort["excluded_slides"] = sorted(
+        known_exclusions.values(), key=lambda item: item["slide_id"]
+    )
+    cohort["usable_slide_ids"] = [record["slide_id"] for record in records]
+    cohort["training_split"] = _training_split_summary(
+        records,
+        mode=args.split_mode,
+        validation_fraction=args.validation_fraction,
+        seed=args.selection_seed,
+    )
+    _atomic_json(cohort_path, cohort)
     rows.sort(key=lambda row: (row["slide_id"], int(row["y"]), int(row["x"])))
     _atomic_csv(args.output_root / "all_patches.csv", rows)
     include_test = args.split_mode == "official"
@@ -605,6 +681,7 @@ def prepare(args) -> dict:
     )
     summary = {
         "slides": len(records),
+        "excluded_slides": len(known_exclusions),
         "patches": len(rows),
         "tumor_patches": sum(int(row["has_tumor"]) for row in rows),
         "selection": selection,

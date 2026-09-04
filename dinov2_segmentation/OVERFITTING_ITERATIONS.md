@@ -75,15 +75,8 @@ Stochastic Depth 在训练时随机绕过残差分支、推理时使用完整网
 网络：<https://arxiv.org/abs/1603.09382>。现有 AdamW 与 cosine 调度分别继续依据
 <https://arxiv.org/abs/1711.05101> 和 <https://arxiv.org/abs/1608.03983>。
 
-## Iteration 3：肿瘤面积比例平方差与最新数据
+## Iteration 3：最新数据（面积损失已撤回）
 
-按用户指定，在像素级 CE 和 Dice/Tversky 之外增加每张 patch 的肿瘤面积比例约束：
-
-```text
-area_loss = mean((mean(softmax(logits)[:, tumor]) - mean(target == tumor)) ** 2)
-```
-
-采用面积比例而不是像素总数，使损失不依赖输入分辨率；ignore 区域不参与分母，完全无
-肿瘤的 patch 仍作为合法负样本参与面积约束。新实验设置 `area_loss_weight=1.0`，并与
-Iteration 2 的 `decoder_drop_path_rate=0.2` 一起使用。数据改为启动时最新、文件大小校验
-通过且 WSI/GeoJSON 完整配对的冻结队列；旧 191-WSI 队列及其 checkpoint 不覆盖。
+肿瘤面积比例平方差在正式训练前按用户要求撤回，不再定义、记录或加入总损失。
+当前损失仅保留像素级交叉熵与 Dice/Tversky 重叠损失。数据仍使用文件大小校验
+通过且 WSI/GeoJSON 完整配对的冻结队列，旧 191-WSI 队列及其 checkpoint 不覆盖。

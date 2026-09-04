@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # Freeze the latest complete annotated cohort, prepare Stage1/graph inputs, and
-# train S/ST/STA with the area-fraction MSE regularizer in isolated outputs.
+# train S/ST/STA without the withdrawn tumor-area loss in isolated outputs.
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -9,13 +9,13 @@ work_root="${CERVICAL_WORK_ROOT:-${repo_dir}/Data/cervical_segmentation_latest_a
 python_bin="${PYTHON_BIN:-${repo_dir}/dinov2/.venv/bin/python}"
 gpu_id="${TRAIN_GPU_ID:-1}"
 stage2_variant="${STAGE2_VARIANT:-weighted_pretrain_distance_context}"
-run_suffix="${RUN_SUFFIX:-_dp020_area1}"
+run_suffix="${RUN_SUFFIX:-_dp020_noarea}"
 logs_dir="${work_root}/logs"
 
 mkdir -p "${logs_dir}"
-exec 9>"${work_root}/latest_area_pipeline.lock"
+exec 9>"${work_root}/latest_pipeline.lock"
 if ! flock -n 9; then
-  echo "Another latest-area pipeline is already active for ${work_root}" >&2
+  echo "Another latest-cohort pipeline is already active for ${work_root}" >&2
   exit 1
 fi
 
@@ -32,12 +32,11 @@ env \
 
 pids=()
 for profile in S ST STA; do
-  log_file="${logs_dir}/decoder_area_${profile}_${stage2_variant}_v1.log"
+  log_file="${logs_dir}/decoder_noarea_${profile}_${stage2_variant}_v1.log"
   env \
     CERVICAL_WORK_ROOT="${work_root}" \
     PYTHON_BIN="${python_bin}" \
     DECODER_DROP_PATH_RATE=0.2 \
-    AREA_LOSS_WEIGHT=1.0 \
     RUN_SUFFIX="${run_suffix}" \
     BATCH_SIZE="${BATCH_SIZE:-16}" \
     DECODER_WORKERS="${DECODER_WORKERS:-8}" \

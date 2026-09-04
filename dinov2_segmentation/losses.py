@@ -71,40 +71,6 @@ def foreground_tversky_loss(
     return 1.0 - index
 
 
-def tumor_area_mse_loss(
-    logits: torch.Tensor,
-    target: torch.Tensor,
-    *,
-    ignore_index: int = 255,
-) -> torch.Tensor:
-    """Match predicted and annotated tumor-area fractions per image.
-
-    Fractions, rather than raw pixel counts, keep the scale independent of
-    patch resolution. Empty-tumor patches remain valid negative examples.
-    """
-
-    if logits.ndim != 4 or logits.shape[1] != 2 or target.ndim != 3:
-        raise ValueError(
-            "tumor area MSE requires [B,2,H,W] logits and [B,H,W] target"
-        )
-    valid = target != ignore_index
-    valid_pixels = valid.sum(dim=(1, 2))
-    has_valid_pixels = valid_pixels > 0
-    if not has_valid_pixels.any():
-        return logits.sum() * 0.0
-    valid_float = valid.to(dtype=logits.dtype)
-    denominator = valid_pixels.clamp_min(1).to(dtype=logits.dtype)
-    tumor_probability = logits.softmax(dim=1)[:, 1]
-    predicted_fraction = (tumor_probability * valid_float).sum(dim=(1, 2)) / denominator
-    target_fraction = ((target == 1).to(dtype=logits.dtype) * valid_float).sum(
-        dim=(1, 2)
-    ) / denominator
-    return F.mse_loss(
-        predicted_fraction[has_valid_pixels],
-        target_fraction[has_valid_pixels],
-    )
-
-
 def segmentation_loss(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -112,13 +78,12 @@ def segmentation_loss(
     ignore_index: int = 255,
     cross_entropy_weight: float = 1.0,
     dice_weight: float = 1.0,
-    area_loss_weight: float = 0.0,
     tumor_class_weight: float = 1.0,
     overlap_loss: str = "dice",
     tversky_alpha: float = 0.3,
     tversky_beta: float = 0.7,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    if cross_entropy_weight < 0 or dice_weight < 0 or area_loss_weight < 0:
+    if cross_entropy_weight < 0 or dice_weight < 0:
         raise ValueError("loss component weights must be non-negative")
     if tumor_class_weight <= 0:
         raise ValueError("tumor_class_weight must be positive")
@@ -149,14 +114,8 @@ def segmentation_loss(
         overlap_parts = {"tversky_loss": overlap.detach()}
     else:
         raise ValueError(f"Unsupported overlap_loss: {overlap_loss!r}")
-    area = tumor_area_mse_loss(logits.float(), target, ignore_index=ignore_index)
-    total = (
-        cross_entropy_weight * cross_entropy
-        + dice_weight * overlap
-        + area_loss_weight * area
-    )
+    total = cross_entropy_weight * cross_entropy + dice_weight * overlap
     return total, {
         "cross_entropy": cross_entropy.detach(),
         **overlap_parts,
-        "area_loss": area.detach(),
     }

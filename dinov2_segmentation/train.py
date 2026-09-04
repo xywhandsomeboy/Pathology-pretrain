@@ -99,7 +99,6 @@ def _run_epoch(model, loader, device, args, optimizer=None, scaler=None):
         "loss": 0.0,
         "cross_entropy": 0.0,
         "dice_loss": 0.0,
-        "area_loss": 0.0,
     }
     samples = 0
     amp_enabled = device.type == "cuda" and not args.no_amp

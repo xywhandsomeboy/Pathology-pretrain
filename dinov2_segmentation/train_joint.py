@@ -93,12 +93,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clip-grad", type=float, default=1.0)
     parser.add_argument("--cross-entropy-weight", type=float, default=1.0)
     parser.add_argument(
-        "--area-loss-weight",
-        type=float,
-        default=0.0,
-        help="Weight for per-image squared tumor-area-fraction error",
-    )
-    parser.add_argument(
         "--dice-weight",
         "--overlap-weight",
         dest="dice_weight",
@@ -428,7 +422,6 @@ def _run_epoch(
         "cross_entropy": 0.0,
         "dice_loss": 0.0,
         "tversky_loss": 0.0,
-        "area_loss": 0.0,
     }
     confusion = torch.zeros((args.num_classes, args.num_classes), dtype=torch.int64)
     probability_metrics = (
@@ -474,7 +467,6 @@ def _run_epoch(
                 ignore_index=args.ignore_index,
                 cross_entropy_weight=args.cross_entropy_weight,
                 dice_weight=args.dice_weight,
-                area_loss_weight=args.area_loss_weight,
                 tumor_class_weight=args.tumor_class_weight,
                 overlap_loss=args.overlap_loss,
                 tversky_alpha=args.tversky_alpha,
@@ -613,7 +605,6 @@ def _configuration(args: argparse.Namespace) -> dict:
         "clip_grad",
         "cross_entropy_weight",
         "dice_weight",
-        "area_loss_weight",
         "tumor_class_weight",
         "overlap_loss",
         "tversky_alpha",
@@ -682,17 +673,9 @@ def main() -> None:
         raise ValueError("stage1-unfreeze-blocks must be non-negative")
     if args.tumor_class_weight <= 0:
         raise ValueError("tumor-class-weight must be positive")
-    if (
-        args.cross_entropy_weight < 0
-        or args.dice_weight < 0
-        or args.area_loss_weight < 0
-    ):
+    if args.cross_entropy_weight < 0 or args.dice_weight < 0:
         raise ValueError("loss component weights must be non-negative")
-    if (
-        args.cross_entropy_weight == 0
-        and args.dice_weight == 0
-        and args.area_loss_weight == 0
-    ):
+    if args.cross_entropy_weight == 0 and args.dice_weight == 0:
         raise ValueError("at least one loss component must be enabled")
     if args.tversky_alpha <= 0 or args.tversky_beta <= 0:
         raise ValueError("Tversky alpha and beta must be positive")
@@ -845,7 +828,6 @@ def main() -> None:
             "experiment_profile": "current",
             "tumor_class_weight": 1.0,
             "cross_entropy_weight": 1.0,
-            "area_loss_weight": 0.0,
             "decoder_drop_path_rate": 0.1,
             "overlap_loss": "dice",
             "tversky_alpha": 0.3,

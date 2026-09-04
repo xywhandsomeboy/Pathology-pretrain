@@ -70,7 +70,6 @@ epochs="${DECODER_EPOCHS:-50}"
 batch_size="${BATCH_SIZE:-16}"
 workers="${DECODER_WORKERS:-8}"
 decoder_drop_path_rate="${DECODER_DROP_PATH_RATE:-0.1}"
-area_loss_weight="${AREA_LOSS_WEIGHT:-0.0}"
 run_suffix="${RUN_SUFFIX:-}"
 output_dir="${IMPROVED_OUTPUT_ROOT:-${work_root}/decoder_runs_improved}/${profile}/${stage2_variant}/${decoder_version}${run_suffix}"
 
@@ -145,7 +144,6 @@ command=(
   --early-stopping-min-delta 0.001
   --cross-entropy-weight 1.0
   --overlap-weight 1.0
-  --area-loss-weight "${area_loss_weight}"
   --tumor-class-weight 1.0
   --sampling-mode slide_stratified
   --sampling-positive-fraction 0.60
