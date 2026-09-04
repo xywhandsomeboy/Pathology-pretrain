@@ -21,6 +21,8 @@ stage1_workers="${STAGE1_WORKERS:-8}"
 decoder_epochs="${DECODER_EPOCHS:-50}"
 decoder_workers="${DECODER_WORKERS:-8}"
 prepare_workers="${PREPARE_WORKERS:-4}"
+preprocess_only="${PREPROCESS_ONLY:-0}"
+stage1_gpu="${STAGE1_GPU_ID:-0}"
 v1_batch="${V1_BATCH_SIZE:-16}"
 v2_batch="${V2_BATCH_SIZE:-16}"
 v1_gpu="${V1_GPU_ID:-0}"
@@ -47,6 +49,14 @@ for variant in "${joint_variants[@]}"; do
       ;;
   esac
 done
+[[ "${preprocess_only}" == 0 || "${preprocess_only}" == 1 ]] || {
+  echo "PREPROCESS_ONLY must be 0 or 1." >&2
+  exit 1
+}
+[[ "${stage1_gpu}" =~ ^[0-9]+$ ]] || {
+  echo "STAGE1_GPU_ID must be a non-negative integer." >&2
+  exit 1
+}
 
 stage1_dir="${repo_dir}/dinov2_stage1_Extract2s2"
 stage2_dir="${repo_dir}/dinov2_stage2_2_FmH2ST"
@@ -180,11 +190,11 @@ if [[ ! -f "${stage1_output}/complete" ]]; then
   if [[ -n "$(find "${stage1_output}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     fail "Incomplete Stage1B output exists; preserve it and choose a new CERVICAL_WORK_ROOT: ${stage1_output}"
   fi
-  wait_for_gpu 0
+  wait_for_gpu "${stage1_gpu}"
   log "Extracting cervical patch features with the selected Stage1 checkpoint"
   (
     cd "${stage1_dir}"
-    export CUDA_VISIBLE_DEVICES=0
+    export CUDA_VISIBLE_DEVICES="${stage1_gpu}"
     exec "${python_bin}" -m dinov2.train.train \
       --eval-only \
       --no-resume \
@@ -224,6 +234,12 @@ graph_distance="${work_root}/graphs/distance"
     --require-decoder-metadata
 ) 2>&1 | tee -a "${logs_dir}/build_graphs.log"
 log "Cervical dual-edge and distance-only graph topology/feature memories complete"
+
+if [[ "${preprocess_only}" == 1 ]]; then
+  touch "${work_root}/preprocessing.complete"
+  log "PREPROCESS_ONLY=1; stopping after manifests, Stage1 features and graphs"
+  exit 0
+fi
 
 run_decoder_pair() {
   local variant="$1"

@@ -11,6 +11,7 @@ import pytest
 from openpyxl import Workbook
 
 from dinov2_segmentation.prepare_cervical_data import (
+    _annotation_features,
     _binary_mask,
     _is_exact_file,
     _scaled_polygons,
@@ -193,6 +194,35 @@ def test_all_tumor_grades_render_to_one_binary_value():
 
     assert set(np.unique(mask)) == {0, 1}
     assert mask.sum() > 0
+
+
+def test_background_annotation_polygons_are_validated_but_not_rendered(tmp_path):
+    annotation = tmp_path / "mixed.geojson"
+    payload = {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "properties": {"classification": {"name": "Normal/Inflammation"}},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[0, 0], [8, 0], [8, 8], [0, 8], [0, 0]]],
+                },
+            },
+            {
+                "properties": {"classification": {"name": "High Grade"}},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[[8, 8], [16, 8], [16, 16], [8, 16], [8, 8]]],
+                },
+            },
+        ],
+    }
+    annotation.write_text(json.dumps(payload), encoding="utf-8")
+
+    tumor_features = _annotation_features(annotation)
+
+    assert len(tumor_features) == 1
+    assert tumor_features[0]["properties"]["classification"]["name"] == "High Grade"
 
 
 def test_training_selection_is_deterministic_and_keeps_all_positive(tmp_path):

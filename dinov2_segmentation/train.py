@@ -95,7 +95,12 @@ def _make_loader(path, args, training):
 def _run_epoch(model, loader, device, args, optimizer=None, scaler=None):
     training = optimizer is not None
     model.train(training)
-    totals = {"loss": 0.0, "cross_entropy": 0.0, "dice_loss": 0.0}
+    totals = {
+        "loss": 0.0,
+        "cross_entropy": 0.0,
+        "dice_loss": 0.0,
+        "area_loss": 0.0,
+    }
     samples = 0
     amp_enabled = device.type == "cuda" and not args.no_amp
     for batch in loader:

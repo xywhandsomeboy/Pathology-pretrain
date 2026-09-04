@@ -16,7 +16,11 @@ from torch_geometric.data import Data
 from dinov2_segmentation.data.joint_dataset import JointPatchSegmentationDataset
 from dinov2_segmentation.joint_graph import JointGraphRepository
 from dinov2_segmentation.joint_optim import WarmupCosineScheduler, _vit_blocks
-from dinov2_segmentation.losses import foreground_tversky_loss, segmentation_loss
+from dinov2_segmentation.losses import (
+    foreground_tversky_loss,
+    segmentation_loss,
+    tumor_area_mse_loss,
+)
 from dinov2_segmentation.probability_metrics import binary_confusion_metrics
 from dinov2_segmentation.profiles import validate_experiment_profile
 
@@ -115,6 +119,24 @@ class JointTrainingTest(unittest.TestCase):
             float(weighted_parts["dice_loss"]),
             float(plain_parts["dice_loss"]),
         )
+
+    def test_tumor_area_mse_matches_normalized_area_and_backpropagates(self):
+        logits = torch.zeros(2, 2, 2, 2, requires_grad=True)
+        target = torch.tensor(
+            [[[0, 0], [1, 1]], [[0, 0], [0, 0]]], dtype=torch.int64
+        )
+        loss = tumor_area_mse_loss(logits, target)
+        self.assertAlmostEqual(float(loss), 0.125)
+        loss.backward()
+        self.assertGreater(float(logits.grad.abs().sum()), 0.0)
+
+    def test_area_loss_weight_is_additive_and_reported(self):
+        logits = torch.zeros(1, 2, 2, 2)
+        target = torch.zeros(1, 2, 2, dtype=torch.int64)
+        plain, _ = segmentation_loss(logits, target)
+        weighted, parts = segmentation_loss(logits, target, area_loss_weight=2.0)
+        self.assertAlmostEqual(float(parts["area_loss"]), 0.25)
+        self.assertAlmostEqual(float(weighted - plain), 0.5)
 
     def test_raw_dataset_and_binary_mask(self):
         with tempfile.TemporaryDirectory() as directory:

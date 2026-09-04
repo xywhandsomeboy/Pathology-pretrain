@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw
 TUMOR_CATEGORIES = {"low_grade", "high_grade", "malignant"}
 NORMAL_CATEGORY = "normal_inflammation"
 TUMOR_ANNOTATIONS = {"low grade", "high grade", "malignant"}
+BACKGROUND_ANNOTATIONS = {"normal", "normal/inflammation"}
 PATCH_FIELDS = (
     "slide_name_split",
     "slide_id",
@@ -129,6 +130,7 @@ def _annotation_features(path: Path) -> list[dict]:
     if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
         raise ValueError(f"Invalid GeoJSON FeatureCollection: {path}")
     features = payload["features"]
+    tumor_features = []
     for feature in features:
         name = (
             feature.get("properties", {})
@@ -136,9 +138,11 @@ def _annotation_features(path: Path) -> list[dict]:
             .get("name", "")
         )
         normalized = _normalized_annotation(name)
-        if normalized not in TUMOR_ANNOTATIONS:
+        if normalized not in TUMOR_ANNOTATIONS | BACKGROUND_ANNOTATIONS:
             raise ValueError(f"Unknown non-empty annotation label {name!r} in {path}")
-    return features
+        if normalized in TUMOR_ANNOTATIONS:
+            tumor_features.append(feature)
+    return tumor_features
 
 
 def discover_ready(args) -> tuple[list[dict], dict]:
@@ -206,6 +210,8 @@ def discover_ready(args) -> tuple[list[dict], dict]:
             "low_grade": 1,
             "high_grade": 1,
             "malignant": 1,
+            "normal_annotation": 0,
+            "normal/inflammation_annotation": 0,
         },
     }
     return ready, status
@@ -334,7 +340,7 @@ def _process_slide(record: dict, args, expected: dict[str, int]) -> list[dict]:
         "patch_size": args.patch_size,
         "stride": args.stride,
         "minimum_tissue_fraction": args.minimum_tissue_fraction,
-        "binary_label_version": 1,
+        "binary_label_version": 2,
     }
     if marker_path.is_file():
         existing = json.loads(marker_path.read_text(encoding="utf-8"))

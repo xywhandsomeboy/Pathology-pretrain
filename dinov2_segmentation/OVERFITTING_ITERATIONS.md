@@ -74,3 +74,16 @@ S/ST/STA 损失定义、颜色增强、AdamW、各参数组学习率、warm-up/c
 Stochastic Depth 在训练时随机绕过残差分支、推理时使用完整网络，用于正则化深层残差
 网络：<https://arxiv.org/abs/1603.09382>。现有 AdamW 与 cosine 调度分别继续依据
 <https://arxiv.org/abs/1711.05101> 和 <https://arxiv.org/abs/1608.03983>。
+
+## Iteration 3：肿瘤面积比例平方差与最新数据
+
+按用户指定，在像素级 CE 和 Dice/Tversky 之外增加每张 patch 的肿瘤面积比例约束：
+
+```text
+area_loss = mean((mean(softmax(logits)[:, tumor]) - mean(target == tumor)) ** 2)
+```
+
+采用面积比例而不是像素总数，使损失不依赖输入分辨率；ignore 区域不参与分母，完全无
+肿瘤的 patch 仍作为合法负样本参与面积约束。新实验设置 `area_loss_weight=1.0`，并与
+Iteration 2 的 `decoder_drop_path_rate=0.2` 一起使用。数据改为启动时最新、文件大小校验
+通过且 WSI/GeoJSON 完整配对的冻结队列；旧 191-WSI 队列及其 checkpoint 不覆盖。
