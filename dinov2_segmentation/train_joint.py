@@ -53,7 +53,7 @@ def _load(path: str | Path):
         return torch.load(path, map_location="cpu")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--decoder-version", choices=("v1", "v2"), required=True)
     parser.add_argument(
@@ -193,7 +193,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Do not count early-stopping patience before this zero-based epoch",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _set_seed(seed: int) -> None:
@@ -210,7 +210,7 @@ def _make_scaler(enabled: bool):
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def _loader(path: Path, args: argparse.Namespace, training: bool) -> DataLoader:
+def _loader(path: Path, args: argparse.Namespace, training: bool, execution=None) -> DataLoader:
     dataset = JointPatchSegmentationDataset(
         path,
         image_size=args.image_size,
@@ -223,13 +223,31 @@ def _loader(path: Path, args: argparse.Namespace, training: bool) -> DataLoader:
         sampler = SlideStratifiedSampler(
             dataset.rows,
             num_samples=args.sampling_epoch_samples or len(dataset),
-            batch_size=args.batch_size,
+            batch_size=args.batch_size * (execution.world_size if execution is not None else 1),
             positive_fraction=args.sampling_positive_fraction,
             boundary_positive_fraction=args.sampling_boundary_positive_fraction,
             interior_threshold=args.sampling_interior_threshold,
             slide_balance_power=args.sampling_slide_balance_power,
             max_patch_repeats=args.sampling_max_patch_repeats,
             seed=args.seed,
+        )
+    if execution is not None and execution.distributed:
+        from dinov2_segmentation.distributed_execution import EpochRandomSampler
+        from torch.utils.data import SequentialSampler
+
+        if sampler is None:
+            sampler = (
+                EpochRandomSampler(dataset, seed=args.seed)
+                if training else SequentialSampler(dataset)
+            )
+        batch_sampler = execution.shard_batches(sampler, args.batch_size, training=training)
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=args.workers,
+            pin_memory=execution.device.type == "cuda",
+            persistent_workers=args.workers > 0,
+            generator=generator,
         )
     return DataLoader(
         dataset,
@@ -414,6 +432,7 @@ def _run_epoch(
     scaler=None,
     gradient_audit: dict | None = None,
     training_phase: dict | None = None,
+    execution=None,
 ) -> dict:
     training = optimizer is not None
     _set_runtime_modes(system, training=training, phase=training_phase)
@@ -450,18 +469,30 @@ def _run_epoch(
             dtype=amp_dtype,
             enabled=amp_enabled,
         ):
-            node_features, dense_tokens = system.stage1(images)
-            contexts = graph_repository.contextualize(
-                system.stage2,
-                node_features,
-                list(batch["slide_id"]),
-                list(batch["patch_id"]),
-                num_hops=system.stage2_runtime.num_layers,
-                use_edge_attr=system.stage2_runtime.use_edge_attr,
-                update_memory=training,
-            )
-            logits = system.decode(images, dense_tokens, contexts)
-            loss, parts = segmentation_loss(
+            if execution is None:
+                node_features, dense_tokens = system.stage1(images)
+                contexts = graph_repository.contextualize(
+                    system.stage2,
+                    node_features,
+                    list(batch["slide_id"]),
+                    list(batch["patch_id"]),
+                    num_hops=system.stage2_runtime.num_layers,
+                    use_edge_attr=system.stage2_runtime.use_edge_attr,
+                    update_memory=training,
+                )
+                logits = system.decode(images, dense_tokens, contexts)
+            else:
+                logits = execution.forward(
+                    system, graph_repository, images,
+                    list(batch["slide_id"]), list(batch["patch_id"]),
+                    training=training,
+                )
+            loss_function = segmentation_loss
+            if training and execution is not None and execution.distributed:
+                from dinov2_segmentation.distributed_losses import segmentation_loss_distributed
+
+                loss_function = segmentation_loss_distributed
+            loss, parts = loss_function(
                 logits,
                 target,
                 ignore_index=args.ignore_index,
@@ -472,7 +503,11 @@ def _run_epoch(
                 tversky_alpha=args.tversky_alpha,
                 tversky_beta=args.tversky_beta,
             )
-        if not torch.isfinite(loss):
+        finite = (
+            execution.all_finite(loss)
+            if training and execution is not None else bool(torch.isfinite(loss))
+        )
+        if not finite:
             raise FloatingPointError(f"Non-finite joint loss at batch {batch_index}: {loss}")
         if training:
             scaler.scale(loss).backward()
@@ -503,6 +538,8 @@ def _run_epoch(
                         observed["stage1_backbone_grad_norm"] = _gradient_norm(
                             system.stage1.backbone
                         )
+                    if execution is not None:
+                        observed = execution.reduce_max_values(observed)
                     gradient_audit["updates_observed"] = int(
                         gradient_audit.get("updates_observed", 0)
                     ) + 1
@@ -560,7 +597,10 @@ def _run_epoch(
                 target,
                 ignore_index=args.ignore_index,
             )
-        if training and (batch_index + 1) % args.log_interval == 0:
+        if (
+            training and (batch_index + 1) % args.log_interval == 0
+            and (execution is None or execution.is_primary)
+        ):
             elapsed = time.monotonic() - start
             print(
                 json.dumps(
@@ -575,6 +615,10 @@ def _run_epoch(
                 ),
                 flush=True,
             )
+    if execution is not None:
+        totals, samples, confusion, probability_metrics = execution.reduce_metrics(
+            totals, samples, confusion, probability_metrics
+        )
     return _metrics(totals, samples, confusion, probability_metrics)
 
 
@@ -634,8 +678,9 @@ def _configuration(args: argparse.Namespace) -> dict:
     return {key: getattr(args, key) for key in keys}
 
 
-def main() -> None:
-    args = parse_args()
+def main(args=None, execution=None) -> None:
+    args = parse_args() if args is None else args
+    is_primary = execution is None or execution.is_primary
     if args.num_classes != 2:
         raise ValueError("The cervical workflow requires binary background/tumor output")
     if not 0.0 <= args.decoder_drop_path_rate < 1.0:
@@ -719,9 +764,12 @@ def main() -> None:
     if args.resume is None and last_checkpoint.exists():
         raise FileExistsError(f"Use --resume for existing run: {last_checkpoint}")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader = _loader(args.train_manifest, args, training=True)
-    val_loader = _loader(args.val_manifest, args, training=False)
+    device = (
+        execution.device if execution is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    )
+    train_loader = _loader(args.train_manifest, args, training=True, execution=execution)
+    val_loader = _loader(args.val_manifest, args, training=False, execution=execution)
     system = JointSegmentationSystem(
         decoder_version=args.decoder_version,
         stage1_config=args.stage1_config,
@@ -731,6 +779,11 @@ def main() -> None:
         num_classes=args.num_classes,
         decoder_drop_path_rate=args.decoder_drop_path_rate,
     ).to(device)
+    if getattr(args, "init_checkpoint", None) is not None:
+        initial = _load(args.init_checkpoint)
+        if initial.get("model_version") != system.model_version:
+            raise ValueError("Initialization checkpoint model version differs")
+        system.load_state_dict(initial["model"], strict=True)
     optimizer, group_metadata = build_joint_adamw(
         system,
         decoder_lr=args.decoder_lr,
@@ -745,6 +798,8 @@ def main() -> None:
         if args.max_train_batches > 0
         else len(train_loader)
     )
+    if train_batches == 0:
+        raise ValueError("No training batches; reduce per-GPU batch size or world size")
     updates_per_epoch = math.ceil(train_batches / args.gradient_accumulation)
     total_steps = max(1, updates_per_epoch * args.epochs)
     warmup_steps = min(total_steps - 1, round(total_steps * args.warmup_ratio))
@@ -805,10 +860,19 @@ def main() -> None:
         },
         "paper_references": PAPER_REFERENCES,
     }
-    (args.output_dir / "run_manifest.json").write_text(
-        json.dumps(run_manifest, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
+    execution_metadata = None
+    if execution is not None:
+        from dinov2_segmentation.train_joint_parallel import execution_manifest
+
+        execution_metadata = execution_manifest(args, execution, train_loader)
+        run_manifest["execution"] = execution_metadata
+        run_manifest["initialization_checkpoint"] = (
+            str(args.init_checkpoint) if args.init_checkpoint else None
+        )
+        source_sampler = getattr(train_loader.batch_sampler, "sampler", train_loader.sampler)
+        run_manifest["sampling"] = getattr(
+            source_sampler, "summary", run_manifest["sampling"]
+        )
 
     start_epoch = 0
     best_dice = -1.0
@@ -819,6 +883,15 @@ def main() -> None:
     epochs_without_improvement = 0
     if args.resume is not None:
         checkpoint = _load(args.resume)
+        if execution is not None and checkpoint.get("execution") != execution_metadata:
+            raise ValueError(
+                "Resume execution or dataset differs. Use --init-checkpoint in a fresh "
+                "output directory to change GPU count or data; this restarts optimizer/scheduler."
+            )
+        if execution is not None:
+            run_manifest["initialization_checkpoint"] = checkpoint.get(
+                "run_manifest", {}
+            ).get("initialization_checkpoint")
         if checkpoint.get("model_version") != system.model_version:
             raise ValueError("Resume checkpoint model version differs")
         checkpoint_configuration = dict(checkpoint.get("configuration", {}))
@@ -865,26 +938,48 @@ def main() -> None:
                 for record in json.loads(history_path.read_text(encoding="utf-8"))
                 if int(record["epoch"]) < start_epoch
             ]
+        elif execution is not None:
+            history = [
+                record for record in checkpoint.get("history", [])
+                if int(record["epoch"]) < start_epoch
+            ]
+            if start_epoch > 0 and not history:
+                raise ValueError("Resume checkpoint lacks epoch history")
+
+    if is_primary:
+        (args.output_dir / "run_manifest.json").write_text(
+            json.dumps(run_manifest, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    if execution is not None:
+        execution.barrier()
 
     for epoch in range(start_epoch, args.epochs):
-        set_sampler_epoch = getattr(train_loader.sampler, "set_epoch", None)
+        epoch_sampler = (
+            train_loader.batch_sampler
+            if execution is not None and execution.distributed else train_loader.sampler
+        )
+        set_sampler_epoch = getattr(epoch_sampler, "set_epoch", None)
         if callable(set_sampler_epoch):
             set_sampler_epoch(epoch)
         phase = _training_phase(system, optimizer, scheduler, epoch, args)
-        print(
-            json.dumps(
-                {
-                    "training_phase": phase,
-                    "active_lr_min": min(
-                        group["lr"]
-                        for group in optimizer.param_groups
-                        if group["lr"] > 0
-                    ),
-                    "active_lr_max": max(group["lr"] for group in optimizer.param_groups),
-                }
-            ),
-            flush=True,
-        )
+        if execution is not None:
+            execution.prepare_model(system, phase_signature=phase["name"])
+        if is_primary:
+            print(
+                json.dumps(
+                    {
+                        "training_phase": phase,
+                        "active_lr_min": min(
+                            group["lr"]
+                            for group in optimizer.param_groups
+                            if group["lr"] > 0
+                        ),
+                        "active_lr_max": max(group["lr"] for group in optimizer.param_groups),
+                    }
+                ),
+                flush=True,
+            )
         train_metrics = _run_epoch(
             system,
             train_graphs,
@@ -896,7 +991,10 @@ def main() -> None:
             scaler=scaler,
             gradient_audit=gradient_audit,
             training_phase=phase,
+            execution=execution,
         )
+        if execution is not None:
+            execution.sync_buffers(system)
         with torch.no_grad():
             val_metrics = _run_epoch(
                 system,
@@ -904,6 +1002,7 @@ def main() -> None:
                 val_loader,
                 device,
                 args,
+                execution=execution,
             )
         record = {
             "epoch": epoch,
@@ -914,7 +1013,8 @@ def main() -> None:
             "training_phase": phase["name"],
         }
         history.append(record)
-        print(json.dumps(record, ensure_ascii=False), flush=True)
+        if is_primary:
+            print(json.dumps(record, ensure_ascii=False), flush=True)
         improved = val_metrics["tumor_dice"] > best_dice
         best_dice = max(best_dice, val_metrics["tumor_dice"])
         should_check_early_stopping = (
@@ -948,16 +1048,22 @@ def main() -> None:
             "epochs_without_improvement": epochs_without_improvement,
             "run_manifest": run_manifest,
         }
-        _atomic_torch_save(state, last_checkpoint)
-        if improved:
-            _atomic_torch_save(state, args.output_dir / "checkpoint_best.pt")
-        history_path.write_text(
-            json.dumps(history, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
-        )
-        (args.output_dir / "gradient_audit.json").write_text(
-            json.dumps(gradient_audit, indent=2) + "\n", encoding="utf-8"
-        )
+        if execution_metadata is not None:
+            state["execution"] = execution_metadata
+            state["history"] = list(history)
+        if is_primary:
+            _atomic_torch_save(state, last_checkpoint)
+            if improved:
+                _atomic_torch_save(state, args.output_dir / "checkpoint_best.pt")
+            history_path.write_text(
+                json.dumps(history, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            (args.output_dir / "gradient_audit.json").write_text(
+                json.dumps(gradient_audit, indent=2) + "\n", encoding="utf-8"
+            )
+        if execution is not None:
+            execution.barrier()
         if (
             should_check_early_stopping
             and epochs_without_improvement >= args.early_stopping_patience
@@ -972,10 +1078,11 @@ def main() -> None:
                 "minimum_delta": args.early_stopping_min_delta,
                 "start_epoch": args.early_stopping_start_epoch,
             }
-            (args.output_dir / "early_stopping.json").write_text(
-                json.dumps(early_stopping, indent=2) + "\n", encoding="utf-8"
-            )
-            print(json.dumps({"early_stopping": early_stopping}), flush=True)
+            if is_primary:
+                (args.output_dir / "early_stopping.json").write_text(
+                    json.dumps(early_stopping, indent=2) + "\n", encoding="utf-8"
+                )
+                print(json.dumps({"early_stopping": early_stopping}), flush=True)
             break
     if not gradient_audit.get("complete", False):
         raise RuntimeError(
@@ -983,8 +1090,19 @@ def main() -> None:
             "Stage2 and decoder all received "
             f"a non-zero supervised gradient: {gradient_audit}"
         )
+    if execution is not None and is_primary and start_epoch >= args.epochs:
+        # A completed checkpoint can be restored into a fresh directory. Keep
+        # its history and last state alongside the completion marker there.
+        checkpoint["run_manifest"] = run_manifest
+        _atomic_torch_save(checkpoint, last_checkpoint)
+        history_path.write_text(
+            json.dumps(history, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+        (args.output_dir / "gradient_audit.json").write_text(
+            json.dumps(gradient_audit, indent=2) + "\n", encoding="utf-8"
+        )
     early_stopping_path = args.output_dir / "early_stopping.json"
-    if not early_stopping_path.exists():
+    if is_primary and not early_stopping_path.exists():
         early_stopping_path.write_text(
             json.dumps(
                 {
@@ -1002,7 +1120,10 @@ def main() -> None:
             + "\n",
             encoding="utf-8",
         )
-    complete_path.touch()
+    if is_primary:
+        complete_path.touch()
+    if execution is not None:
+        execution.barrier()
 
 
 if __name__ == "__main__":
