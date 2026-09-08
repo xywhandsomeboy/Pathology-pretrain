@@ -1,10 +1,26 @@
 """CPU invariants for the independent full-resolution Decoder V2."""
 
+from pathlib import Path
+import sys
 import unittest
+from unittest import mock
 
 import torch
+from torch import nn
 
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parents[2] / "dinov2_stage2_2_FmH2ST"),
+)
+
+from dinov2_segmentation.joint_model import JointSegmentationSystem
 from dinov2_segmentation.models.model_v2 import GlobalLocalSegmentationModelV2
+
+
+class _TinyStage1(nn.Module):
+    def __init__(self, *_args, **_kwargs):
+        super().__init__()
+        self.embed_dim = 16
 
 
 class DecoderV2Test(unittest.TestCase):
@@ -76,6 +92,25 @@ class DecoderV2Test(unittest.TestCase):
         )
         for block in self.model.decoder.correction_blocks:
             self.assertIsNotNone(block.residual_scale.grad)
+
+    def test_joint_system_constructs_v2_with_shared_cli_options(self):
+        with mock.patch(
+            "dinov2_segmentation.joint_model.TrainableStage1", _TinyStage1
+        ), mock.patch(
+            "dinov2_segmentation.joint_model.build_trainable_stage2",
+            return_value=(nn.Identity(), object()),
+        ):
+            system = JointSegmentationSystem(
+                decoder_version="v2",
+                stage1_config="unused-stage1-config.yaml",
+                stage1_checkpoint="unused-stage1-checkpoint.pt",
+                stage2_config="unused-stage2-config.yaml",
+                stage2_checkpoint="unused-stage2-checkpoint.pt",
+                num_classes=2,
+                decoder_drop_path_rate=0.2,
+            )
+
+        self.assertIsInstance(system.decoder, GlobalLocalSegmentationModelV2)
 
 
 if __name__ == "__main__":

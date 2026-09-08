@@ -359,7 +359,6 @@ class JointSegmentationSystem(nn.Module):
                 num_classes=num_classes,
                 token_dim=self.stage1.embed_dim,
                 context_dim=self.stage1.embed_dim,
-                drop_path_rate=decoder_drop_path_rate,
             )
         else:
             raise ValueError("decoder_version must be 'v1' or 'v2'")
