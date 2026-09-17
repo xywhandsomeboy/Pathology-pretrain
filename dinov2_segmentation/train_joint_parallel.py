@@ -26,6 +26,14 @@ def parse_args(argv=None):
         "--init-checkpoint", type=Path,
         help="Load joint model weights only into a fresh run; optimizer and schedule restart",
     )
+    parser.add_argument(
+        "--migrate-resume",
+        type=Path,
+        help=(
+            "Explicitly migrate a completed serial epoch checkpoint to DDP while "
+            "retaining model and optimizer state and rebasing its schedule"
+        ),
+    )
     if "--help" in argv or "-h" in argv:
         print(parser.format_help())
     execution_args, remaining = parser.parse_known_args(argv)
@@ -33,12 +41,27 @@ def parse_args(argv=None):
     args.execution_mode = execution_args.execution_mode
     args.device = execution_args.device
     args.init_checkpoint = execution_args.init_checkpoint
-    if args.init_checkpoint is not None:
-        args.init_checkpoint = args.init_checkpoint.expanduser().resolve()
-        if not args.init_checkpoint.is_file():
-            raise FileNotFoundError(args.init_checkpoint)
-        if args.resume is not None:
-            raise ValueError("--init-checkpoint and --resume cannot be combined")
+    args.migrate_resume = execution_args.migrate_resume
+    selected = [
+        name
+        for name, value in (
+            ("--resume", args.resume),
+            ("--init-checkpoint", args.init_checkpoint),
+            ("--migrate-resume", args.migrate_resume),
+        )
+        if value is not None
+    ]
+    if len(selected) > 1:
+        raise ValueError(f"{', '.join(selected)} cannot be combined")
+    for name in ("init_checkpoint", "migrate_resume"):
+        value = getattr(args, name)
+        if value is not None:
+            value = value.expanduser().resolve()
+            if not value.is_file():
+                raise FileNotFoundError(value)
+            setattr(args, name, value)
+    if args.migrate_resume is not None and args.execution_mode != "ddp":
+        raise ValueError("--migrate-resume requires --execution-mode ddp")
     return args
 
 

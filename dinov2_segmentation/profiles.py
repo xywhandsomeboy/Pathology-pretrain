@@ -17,12 +17,17 @@ def validate_experiment_profile(args: argparse.Namespace) -> None:
     overlap_loss, color_augmentation = expected[args.experiment_profile]
     mismatches = []
     for name, actual, required in (
-        ("sampling_mode", args.sampling_mode, "slide_stratified"),
         ("overlap_loss", args.overlap_loss, overlap_loss),
         ("color_augmentation", args.color_augmentation, color_augmentation),
     ):
         if actual != required:
             mismatches.append(f"{name}={actual!r}, expected {required!r}")
+    if args.sampling_mode not in {"slide_stratified", "wsi_local_stratified"}:
+        mismatches.append(
+            "sampling_mode="
+            f"{args.sampling_mode!r}, expected 'slide_stratified' or "
+            "'wsi_local_stratified'"
+        )
     for name, required in (
         ("sampling_positive_fraction", 0.60),
         ("sampling_boundary_positive_fraction", 0.50),

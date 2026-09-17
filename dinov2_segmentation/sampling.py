@@ -280,3 +280,272 @@ class SlideStratifiedSampler(Sampler[int]):
                 )
             used_in_batch.add(candidate)
             yield candidate
+
+
+class WSILocalStratifiedSampler(SlideStratifiedSampler):
+    """Keep the balanced population, then pack targets into local WSI regions.
+
+    ``SlideStratifiedSampler`` controls *which* patches occur in an epoch.  This
+    sampler leaves that population, its stratum counts, and per-patch repeat cap
+    unchanged, but reorders it so a loader batch normally comes from one spatial
+    run on a single WSI.  A positive item is swapped into an all-negative run
+    when necessary, so the foreground-loss contract remains true.  The small
+    number of such swaps is intentional: it retains a useful loss on normal
+    slides while still making the graph receptive fields strongly overlap.
+
+    The graph code remains responsible for constructing each target set's full
+    k-hop closure.  This class changes I/O locality only; it does not introduce
+    historical neighbour embeddings or a persistent fusion-feature cache.
+    """
+
+    def __init__(
+        self,
+        rows: Sequence[Mapping[str, object]],
+        *,
+        locality_tile_size: int = 4096,
+        global_batch_size: int | None = None,
+        **kwargs,
+    ) -> None:
+        self.locality_tile_size = int(locality_tile_size)
+        if self.locality_tile_size < 1:
+            raise ValueError("locality_tile_size must be positive")
+        self._row_slide_ids: list[str] = []
+        self._coordinates: list[tuple[int, int]] = []
+        for index, row in enumerate(rows):
+            slide_id = str(row.get("slide_id", "")).strip()
+            if not slide_id:
+                raise ValueError(f"row {index} has no slide_id")
+            try:
+                coordinate = (int(row["x"]), int(row["y"]))
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "WSI-local sampling requires integer x and y manifest columns"
+                ) from error
+            self._row_slide_ids.append(slide_id)
+            self._coordinates.append(coordinate)
+        self._rows = rows
+        super().__init__(rows, **kwargs)
+        self.global_batch_size = int(global_batch_size or self.batch_size)
+        if (self.global_batch_size < self.batch_size
+                or self.global_batch_size % self.batch_size):
+            raise ValueError(
+                "global_batch_size must be a positive multiple of batch_size"
+            )
+
+    @property
+    def summary(self) -> dict[str, object]:
+        result = dict(super().summary)
+        result.update(
+            {
+                "name": "wsi_local_stratified_boundary",
+                "locality_tile_size": self.locality_tile_size,
+                "global_batch_size": self.global_batch_size,
+                "effective_num_samples": len(self),
+                "locality_contract": (
+                    "same-WSI spatial target runs; exact full k-hop closure "
+                    "is still recomputed by the graph repository"
+                ),
+            }
+        )
+        return result
+
+    def __len__(self) -> int:
+        # Match the existing DDP wrapper's tail-drop rule here, before local
+        # batches are rearranged.  Serial use has global_batch_size=batch_size
+        # and therefore keeps the ordinary final partial batch.
+        if self.global_batch_size == self.batch_size:
+            return self.num_samples
+        return self.num_samples - self.num_samples % self.global_batch_size
+
+    def _spatial_key(self, index: int) -> tuple[int, int, int, int]:
+        x, y = self._coordinates[index]
+        tile = self.locality_tile_size
+        return (y // tile, x // tile, y, x)
+
+    def _slide_chunks(
+        self, selected: Sequence[int], rng: random.Random
+    ) -> list[list[int]]:
+        """Build unique, spatially contiguous chunks for each selected WSI."""
+
+        by_slide: dict[str, Counter[int]] = defaultdict(Counter)
+        for index in selected:
+            by_slide[self._row_slide_ids[index]][index] += 1
+
+        chunks: list[list[int]] = []
+        for slide_id in sorted(by_slide):
+            remaining = by_slide[slide_id]
+            ordered = sorted(remaining, key=self._spatial_key)
+            # Vary the seam each epoch without breaking local coordinate order.
+            if len(ordered) > 1:
+                offset = rng.randrange(len(ordered))
+                ordered = ordered[offset:] + ordered[:offset]
+            while sum(remaining.values()):
+                chunk: list[int] = []
+                for index in ordered:
+                    if remaining[index] == 0:
+                        continue
+                    # A repeated patch must never appear twice in one target
+                    # batch, even when the repeat cap is active.
+                    chunk.append(index)
+                    remaining[index] -= 1
+                    if len(chunk) == self.batch_size:
+                        break
+                if not chunk:
+                    raise RuntimeError("Unable to make a non-empty WSI-local chunk")
+                chunks.append(chunk)
+        rng.shuffle(chunks)
+        return chunks
+
+    @staticmethod
+    def _contains_positive(
+        batch: Sequence[int], rows: Sequence[Mapping[str, object]], threshold: float
+    ) -> bool:
+        return any(patch_stratum(rows[index], interior_threshold=threshold) != NEGATIVE for index in batch)
+
+    def _make_positive_batches(
+        self,
+        chunks: Sequence[list[int]],
+        rows: Sequence[Mapping[str, object]],
+    ) -> list[list[int]]:
+        """Pack partial chunks and retain at least one positive per full batch."""
+
+        full = [list(chunk) for chunk in chunks if len(chunk) == self.batch_size]
+        partial = [list(chunk) for chunk in chunks if len(chunk) < self.batch_size]
+        batches = full
+        # A slide can have fewer unique selected patches than a batch because
+        # its repeat cap is active.  Do not concatenate that slide's first and
+        # second pass into one batch: rotate a repeated item to the tail until
+        # another partial WSI fills the vacant position.
+        pending: deque[int] = deque(
+            value for chunk in partial for value in chunk
+        )
+        while pending:
+            batch: list[int] = []
+            used: set[int] = set()
+            attempts_without_draw = 0
+            while pending and len(batch) < self.batch_size:
+                value = pending.popleft()
+                if value in used:
+                    pending.append(value)
+                    attempts_without_draw += 1
+                    if attempts_without_draw >= len(pending):
+                        break
+                    continue
+                batch.append(value)
+                used.add(value)
+                attempts_without_draw = 0
+            if not batch:
+                raise RuntimeError("Unable to pack unique WSI-local targets")
+            batches.append(batch)
+
+        # The last serial batch may be incomplete; the distributed wrapper drops
+        # it where needed.  Full batches retain the base sampler's positive
+        # guarantee with one carefully checked swap.
+        for target_index, target in enumerate(batches):
+            if len(target) < self.batch_size or self._contains_positive(
+                target, rows, self.interior_threshold
+            ):
+                continue
+            target_set = set(target)
+            donor_index = next(
+                (
+                    source_index
+                    for source_index, source in enumerate(batches)
+                    if source_index != target_index
+                    and sum(
+                        patch_stratum(rows[value], interior_threshold=self.interior_threshold)
+                        != NEGATIVE
+                        for value in source
+                    ) > 1
+                    and any(
+                        patch_stratum(rows[value], interior_threshold=self.interior_threshold)
+                        != NEGATIVE
+                        and value not in target_set
+                        for value in source
+                    )
+                    and any(value not in set(source) for value in target)
+                ),
+                None,
+            )
+            if donor_index is None:
+                raise RuntimeError("Unable to retain a positive sample in every batch")
+            donor = batches[donor_index]
+            donor_set = set(donor)
+            donor_position = next(
+                position
+                for position, value in enumerate(donor)
+                if patch_stratum(rows[value], interior_threshold=self.interior_threshold)
+                != NEGATIVE
+                and value not in target_set
+            )
+            target_position = next(
+                position
+                for position, value in enumerate(target)
+                if patch_stratum(rows[value], interior_threshold=self.interior_threshold)
+                == NEGATIVE
+                and donor[donor_position] not in target_set
+                and value not in donor_set
+            )
+            target[target_position], donor[donor_position] = (
+                donor[donor_position],
+                target[target_position],
+            )
+        return batches
+
+    def _group_disjoint_global_batches(
+        self, batches: Sequence[list[int]]
+    ) -> list[list[int]]:
+        """Keep intentional repeats out of one DDP optimizer update.
+
+        The distributed wrapper consumes consecutive local batches as one
+        global batch.  Reorder full local batches so ranks in that update do
+        not receive the same target patch.  This preserves the original
+        sampler's no-repeat-in-a-global-batch invariant without widening the
+        local receptive field.
+        """
+
+        stream = [value for batch in batches for value in batch][: len(self)]
+        local_batches = [
+            stream[start : start + self.batch_size]
+            for start in range(0, len(stream), self.batch_size)
+        ]
+        ranks = self.global_batch_size // self.batch_size
+        full = deque(
+            batch for batch in local_batches if len(batch) == self.batch_size
+        )
+        tail = [batch for batch in local_batches if len(batch) < self.batch_size]
+        ordered: list[list[int]] = []
+        while full:
+            group: list[list[int]] = []
+            used: set[int] = set()
+            attempts = len(full)
+            while full and len(group) < ranks and attempts:
+                candidate = full.popleft()
+                attempts -= 1
+                if set(candidate).isdisjoint(used):
+                    group.append(candidate)
+                    used.update(candidate)
+                else:
+                    full.append(candidate)
+            # A serial final partial batch is retained.  In DDP the explicit
+            # length truncation above makes this branch unreachable.
+            if len(group) < ranks and full:
+                raise RuntimeError(
+                    "Unable to form a duplicate-free distributed target batch"
+                )
+            ordered.extend(group)
+        ordered.extend(tail)
+        return ordered
+
+    def __iter__(self) -> Iterator[int]:
+        # First choose exactly the same balanced population as the established
+        # sampler.  Reordering afterwards makes this a locality ablation, not a
+        # data-population change.
+        selected = list(super().__iter__())
+        rng = random.Random(self.seed + self.epoch + 1_000_003)
+        chunks = self._slide_chunks(selected, rng)
+        batches = self._make_positive_batches(chunks, self._rows)
+        for batch in self._group_disjoint_global_batches(batches):
+            if len(batch) == self.batch_size and len(batch) != len(set(batch)):
+                raise RuntimeError("WSI-local sampler produced a duplicate target")
+            yield from batch

@@ -37,13 +37,16 @@ overlap loss，ST→STA 只增加颜色增强。不要把 Tversky 内部的 FP/F
 
 ## 新增诊断
 
-所有改良 profile 使用 256-bin 流式概率直方图，不在内存保存全部 WSI 像素。每轮记录：
+所有改良 profile 保留 256-bin 流式概率直方图，但训练阶段不执行概率扫描；验证阶段仅在
+每 5 个 epoch 和最终 epoch 计算一次。普通 epoch 从设备端累计的混淆矩阵记录：
 
-- tumor precision、recall、specificity、F2；
-- 预测/真实肿瘤像素比例；
-- 肿瘤像素和背景像素上的平均肿瘤概率；
+- tumor precision、recall、F2；
+- 预测肿瘤像素比例；
+
+概率诊断 epoch 额外记录：
+
 - 近似 PR-AUC；
-- 验证集 F2 最优阈值及该阈值下的 precision/recall。
+- 验证集 F2 最优阈值及该阈值下的 F2。
 
 默认原版仍使用 uniform patch sampling、CE+Dice、无颜色增强、无概率直方图，因此已有命令
 和旧 checkpoint 的训练语义不变。旧 checkpoint 恢复时会自动补齐这些默认配置字段。

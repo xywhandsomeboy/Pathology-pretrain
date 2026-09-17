@@ -254,3 +254,93 @@ class WarmupCosineScheduler:
         self.phase_scales = loaded_scales
         self.current_step = int(state["current_step"])
         self._apply()
+
+
+def remap_warmup_cosine_state(
+    state: dict,
+    *,
+    source_updates_per_epoch: int,
+    target_updates_per_epoch: int,
+    target_total_steps: int,
+    target_warmup_steps: int,
+    completed_epochs: int,
+) -> tuple[dict, dict]:
+    """Rebase an epoch-boundary schedule onto a new execution geometry.
+
+    Serial-to-DDP migration can change the number of optimizer updates in an
+    epoch even when the effective global batch is held constant (for example,
+    DDP deliberately drops a final sample tail that a serial DataLoader keeps).
+    The migration therefore preserves the completed-epoch position rather than
+    silently interpreting the old absolute update index in the new schedule.
+    """
+
+    for name, value in (
+        ("source_updates_per_epoch", source_updates_per_epoch),
+        ("target_updates_per_epoch", target_updates_per_epoch),
+        ("target_total_steps", target_total_steps),
+        ("completed_epochs", completed_epochs),
+    ):
+        if int(value) < 1:
+            raise ValueError(f"{name} must be positive")
+    if not 0 <= int(target_warmup_steps) < int(target_total_steps):
+        raise ValueError("target_warmup_steps must be in [0,target_total_steps)")
+
+    required = {
+        "total_steps",
+        "warmup_steps",
+        "min_ratio",
+        "base_lrs",
+        "current_step",
+    }
+    missing = sorted(required - set(state))
+    if missing:
+        raise ValueError(f"Migration scheduler state lacks keys: {missing}")
+    source_total_steps = int(state["total_steps"])
+    source_warmup_steps = int(state["warmup_steps"])
+    source_current_step = int(state["current_step"])
+    if source_total_steps < 1:
+        raise ValueError("Migration scheduler total_steps must be positive")
+    if not 0 <= source_warmup_steps < source_total_steps:
+        raise ValueError("Migration scheduler warmup_steps is invalid")
+    if not 0 <= source_current_step < source_total_steps:
+        raise ValueError("Migration scheduler current_step is invalid")
+
+    expected_source_step = min(
+        int(completed_epochs) * int(source_updates_per_epoch),
+        source_total_steps - 1,
+    )
+    if source_current_step != expected_source_step:
+        raise ValueError(
+            "Serial migration checkpoint is not at the declared epoch boundary: "
+            f"scheduler.current_step={source_current_step}, "
+            f"expected={expected_source_step}"
+        )
+    target_current_step = min(
+        int(completed_epochs) * int(target_updates_per_epoch),
+        int(target_total_steps) - 1,
+    )
+    remapped = dict(state)
+    remapped.update(
+        {
+            "total_steps": int(target_total_steps),
+            "warmup_steps": int(target_warmup_steps),
+            "current_step": target_current_step,
+        }
+    )
+    provenance = {
+        "policy": "completed_epoch_position",
+        "completed_epochs": int(completed_epochs),
+        "source": {
+            "updates_per_epoch": int(source_updates_per_epoch),
+            "total_steps": source_total_steps,
+            "warmup_steps": source_warmup_steps,
+            "current_step": source_current_step,
+        },
+        "target": {
+            "updates_per_epoch": int(target_updates_per_epoch),
+            "total_steps": int(target_total_steps),
+            "warmup_steps": int(target_warmup_steps),
+            "current_step": target_current_step,
+        },
+    }
+    return remapped, provenance

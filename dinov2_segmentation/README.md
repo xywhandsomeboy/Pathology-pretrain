@@ -1,5 +1,9 @@
 # DINO–GNN 全局语义 + 高分辨率局部分割
 
+分层解冻、严格特征一致性、磁盘权重留存和独立验证的当前入口与配置见
+[训练流程说明](TRAINING_WORKFLOW.md)。本文下方的逐 batch 历史节点更新描述
+对应 `legacy` 特征策略；`staged_consistent` 的行为请以该说明为准。
+
 这个目录实现已经确认的双分支方案。Stage1/Stage2 的预训练彼此独立，但最终分割训练使用
 `train_joint.py` 联合微调 Stage1、Stage2 GATv2 和 Decoder；离线 Stage1B 结果只用于建立
 图拓扑及初始化邻居特征记忆，不能代替最终训练中的在线前向。
@@ -78,22 +82,31 @@ PYTHONPATH=/path/to/CerviPath/dinov2_stage2_2_FmH2ST:/path/to/CerviPath \
   --gradient-accumulation 8
 ```
 
-默认优化依据相关论文采用 AdamW、5% 线性 warm-up 和单周期 cosine decay。默认峰值学习率为：
+默认优化依据相关论文采用 AdamW、固定 `20,000` optimizer step 线性 warm-up 和单周期
+cosine decay。默认峰值学习率为：
 Decoder `2e-4`、Stage2 GATv2 `5e-5`、Stage1 聚合/融合层 `5e-5`、Stage1 ViT 顶层
 `2e-5`；24 个 ViT block 从输出到输入按 `0.9` 逐层衰减。bias、归一化参数和 token/位置
-参数不做 weight decay。首个监督更新必须产生非零 Stage1、Stage2、Decoder 梯度，否则立即
-停止，并把审计结果写入 `gradient_audit.json`。
+参数不做 weight decay。
 
-默认损失为 Cross Entropy + soft Dice，`255` 为 ignore index。模型选择依据验证集肿瘤 Dice，
-同时记录 tumor IoU、pixel accuracy 和完整混淆矩阵。
+解冻由独立于 scheduler 的 `curriculum_step` 控制：前 20,000 步只训练 Decoder；20,000–60,000
+步加入 Stage2 GATv2 和 Stage1 spatial/local/fusion；60,000–100,000 步解冻 DINO 顶部 2
+个 Transformer block；100,000 步后解冻顶部 4 个 block，完成联合微调。每 20,000 个
+optimizer step 保存一次可恢复的 `checkpoint_progress.pt`；模型、优化器、AMP scaler、scheduler、
+`curriculum_step` 和 epoch 内进度共同恢复，解冻阶段不会由 scheduler 步数猜测。梯度审计先
+累计 Stage1 融合、Stage2 和 Decoder，进入顶部 4 层阶段后再确认 DINO backbone 也获得有限
+非零梯度；失败会停止训练并写入 `gradient_audit.json`。
+
+默认损失为 Cross Entropy + soft Dice，`255` 为 ignore index。模型选择依据验证集肿瘤 Dice。
+每轮从设备端累计的完整混淆矩阵统一计算 tumor Dice、precision、recall、F2 和预测肿瘤比例；
+不再记录与 Dice 重复或容易被背景比例掩盖的 IoU、pixel accuracy、specificity 等字段。
 
 需要提高肿瘤漏检代价时，可为新的独立实验添加 `--tumor-class-weight 1.5`。该选项只对
 Cross Entropy 的 class 1 加权，soft Dice 保持不变；默认值 `1.0` 保持原始实验行为。
 
 针对当前数据中“大病灶与病灶内部 patch 占主导、验证 recall 低于 precision”的问题，另有
 互不覆盖原输出的 S（WSI/边界分层采样）、ST（S + 前景 Tversky）和 STA（ST + 温和颜色
-增强）三个训练策略版本。它们同时记录 precision、recall、F2、PR-AUC 近似值和验证集最优
-F2 阈值。完整参数、实测数据分布与启动命令见
+增强）三个训练策略版本。它们每轮记录 precision、recall、F2，并在每 5 轮和最终轮记录
+PR-AUC 近似值及验证集最优 F2 阈值。训练阶段不执行概率直方图扫描。完整参数、实测数据分布与启动命令见
 [`IMBALANCE_AWARE_VARIANTS.md`](IMBALANCE_AWARE_VARIANTS.md)。
 
 完整的论文依据、参数选择和工程取舍见

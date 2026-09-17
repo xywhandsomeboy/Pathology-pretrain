@@ -49,6 +49,11 @@ class WholeBatchShardSampler(Sampler[list[int]]):
     For training with multiple ranks, ``dropped_samples`` reports the tail
     omitted to give every rank equal steps and equal local batch sizes. The
     deterministic source should change its ordering with ``set_epoch``.
+
+    ``set_start_batch`` resumes at a rank-local batch boundary. Advancing the
+    underlying sampler only visits integer indices; skipped samples are never
+    yielded to the ``DataLoader`` and therefore never trigger dataset I/O.
+    Calling ``set_epoch`` starts a new epoch and resets this offset to zero.
     """
 
     def __init__(
@@ -65,11 +70,12 @@ class WholeBatchShardSampler(Sampler[list[int]]):
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.training = bool(training)
+        self.start_batch = 0
         if self.batch_size < 1 or self.world_size < 1:
             raise ValueError("batch_size and world_size must be positive")
         if not 0 <= self.rank < self.world_size:
             raise ValueError("rank must be in [0, world_size)")
-        if self.training and self.world_size > 1 and len(self) == 0:
+        if self.training and self.world_size > 1 and self._total_batches() == 0:
             raise ValueError(
                 "Training needs at least world_size * batch_size samples; "
                 "reduce batch size or the number of ranks"
@@ -85,27 +91,100 @@ class WholeBatchShardSampler(Sampler[list[int]]):
         setter = getattr(self.sampler, "set_epoch", None)
         if setter is not None:
             setter(int(epoch))
+        self.start_batch = 0
 
-    def __len__(self) -> int:
+    def set_start_batch(self, start_batch: int) -> None:
+        """Skip completed local batches when resuming inside an epoch."""
+        start_batch = int(start_batch)
+        total_batches = self._total_batches()
+        if not 0 <= start_batch <= total_batches:
+            raise ValueError(
+                f"start_batch must be in [0, {total_batches}], got {start_batch}"
+            )
+        self.start_batch = start_batch
+
+    def _total_batches(self) -> int:
+        """Return this rank's full-epoch batch count, ignoring resume offset."""
         if self.training and self.world_size > 1:
             return len(self.sampler) // (self.batch_size * self.world_size)
         global_batches = math.ceil(len(self.sampler) / self.batch_size)
         return max(0, (global_batches - self.rank + self.world_size - 1) // self.world_size)
 
+    def __len__(self) -> int:
+        return self._total_batches() - self.start_batch
+
     def __iter__(self) -> Iterator[list[int]]:
         keep_samples = len(self.sampler) - self.dropped_samples
         batch: list[int] = []
         global_batch_index = 0
+        local_batch_index = 0
         for sample_index, value in enumerate(self.sampler):
             if sample_index >= keep_samples:
                 break
             batch.append(int(value))
             if len(batch) == self.batch_size:
                 if global_batch_index % self.world_size == self.rank:
-                    yield batch
+                    if local_batch_index >= self.start_batch:
+                        yield batch
+                    local_batch_index += 1
                 batch = []
                 global_batch_index += 1
         if batch and global_batch_index % self.world_size == self.rank:
+            if local_batch_index >= self.start_batch:
+                yield batch
+
+
+class WholeBatchSampler(Sampler[list[int]]):
+    """Build complete serial batches with restartable epoch-local offsets.
+
+    The source sampler owns ordering and may implement ``set_epoch``. No tail
+    samples are dropped. As with :class:`WholeBatchShardSampler`, setting a new
+    epoch clears the resume offset; callers then apply a saved offset, if any.
+    """
+
+    def __init__(self, sampler, batch_size: int) -> None:
+        self.sampler = sampler
+        self.batch_size = int(batch_size)
+        self.start_batch = 0
+        if self.batch_size < 1:
+            raise ValueError("batch_size must be positive")
+
+    @property
+    def dropped_samples(self) -> int:
+        return 0
+
+    def set_epoch(self, epoch: int) -> None:
+        setter = getattr(self.sampler, "set_epoch", None)
+        if setter is not None:
+            setter(int(epoch))
+        self.start_batch = 0
+
+    def set_start_batch(self, start_batch: int) -> None:
+        start_batch = int(start_batch)
+        total_batches = self._total_batches()
+        if not 0 <= start_batch <= total_batches:
+            raise ValueError(
+                f"start_batch must be in [0, {total_batches}], got {start_batch}"
+            )
+        self.start_batch = start_batch
+
+    def _total_batches(self) -> int:
+        return math.ceil(len(self.sampler) / self.batch_size)
+
+    def __len__(self) -> int:
+        return self._total_batches() - self.start_batch
+
+    def __iter__(self) -> Iterator[list[int]]:
+        batch: list[int] = []
+        batch_index = 0
+        for value in self.sampler:
+            batch.append(int(value))
+            if len(batch) == self.batch_size:
+                if batch_index >= self.start_batch:
+                    yield batch
+                batch = []
+                batch_index += 1
+        if batch and batch_index >= self.start_batch:
             yield batch
 
 
@@ -141,12 +220,13 @@ class _JointForward(nn.Module):
         node_features, dense_tokens = self.system.stage1(images)
         context_repository = repository
         local_context_slice = slice(None)
-        if training and self.execution.distributed:
+        if training and self.execution.distributed and getattr(repository, "feature_provider", None) is None:
             node_features, slide_ids, patch_ids, local_context_slice = (
                 self.execution.gather_graph_inputs(node_features, slide_ids, patch_ids)
             )
             context_repository = self.execution.synchronize_graph_memory(
-                repository, node_features, slide_ids, patch_ids
+                repository, node_features, slide_ids, patch_ids,
+                refresh=getattr(self.system, "refresh_graph_memory", True),
             )
         contexts = context_repository.contextualize(
             self.system.stage2,
@@ -155,7 +235,8 @@ class _JointForward(nn.Module):
             patch_ids,
             num_hops=self.system.stage2_runtime.num_layers,
             use_edge_attr=self.system.stage2_runtime.use_edge_attr,
-            update_memory=bool(training and not self.execution.distributed),
+            update_memory=bool(training and not self.execution.distributed
+                               and getattr(self.system, "refresh_graph_memory", True)),
         )
         return self.system.decode(images, dense_tokens, contexts[local_context_slice])
 
@@ -296,7 +377,7 @@ class DistributedExecution:
         return features, global_slides, global_patches, slice(offset, offset + shape[0])
 
     @torch.no_grad()
-    def synchronize_graph_memory(self, repository, node_features, slide_ids, patch_ids):
+    def synchronize_graph_memory(self, repository, node_features, slide_ids, patch_ids, *, refresh=True):
         """Refresh detached global memories, then pin a common graph view.
 
         Inputs already follow rank order from ``gather_graph_inputs``. Every
@@ -315,7 +396,8 @@ class DistributedExecution:
                 replacements[patch_to_index[patch]] = feature
             indices = torch.tensor(list(replacements), dtype=torch.long, device=graph.x.device)
             values = torch.stack(list(replacements.values())).to(graph.x)
-            graph.x.index_copy_(0, indices, values)
+            if refresh:
+                graph.x.index_copy_(0, indices, values)
             pinned[slide] = (graph, patch_to_index)
         return _PinnedRepository(repository, pinned)
 
@@ -343,18 +425,37 @@ class DistributedExecution:
 
     def reduce_metrics(self, totals: dict, samples: int, confusion, probability_metrics=None):
         keys = sorted(totals)
-        raw_totals = self._reduce(torch.tensor([totals[key] for key in keys], dtype=torch.float64))
+        raw_totals = self._reduce(
+            torch.stack(
+                [
+                    totals[key].detach().to(device=self.device, dtype=torch.float64)
+                    if torch.is_tensor(totals[key])
+                    else torch.tensor(
+                        totals[key], device=self.device, dtype=torch.float64
+                    )
+                    for key in keys
+                ]
+            )
+        )
         count = self._reduce(torch.tensor(samples, dtype=torch.int64))
         confusion = self._reduce(confusion)
         if probability_metrics is not None:
             for name in ("positive_histogram", "negative_histogram"):
-                setattr(probability_metrics, name, self._reduce(getattr(probability_metrics, name)))
-            sums = self._reduce(torch.tensor([
-                probability_metrics.positive_probability_sum,
-                probability_metrics.negative_probability_sum,
-            ], dtype=torch.float64))
-            probability_metrics.positive_probability_sum = float(sums[0])
-            probability_metrics.negative_probability_sum = float(sums[1])
+                setattr(
+                    probability_metrics,
+                    name,
+                    self._reduce(getattr(probability_metrics, name)),
+                )
+            sums = self._reduce(
+                torch.stack(
+                    (
+                        probability_metrics.positive_probability_sum,
+                        probability_metrics.negative_probability_sum,
+                    )
+                )
+            )
+            probability_metrics.positive_probability_sum = sums[0]
+            probability_metrics.negative_probability_sum = sums[1]
         return dict(zip(keys, raw_totals.tolist())), int(count), confusion, probability_metrics
 
     @torch.no_grad()

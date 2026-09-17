@@ -40,14 +40,27 @@ def binary_confusion_metrics(confusion: torch.Tensor) -> dict[str, float]:
 class BinaryProbabilityMetrics:
     """Accumulate a bounded histogram instead of retaining billions of pixels."""
 
-    def __init__(self, bins: int = 256) -> None:
+    def __init__(
+        self,
+        bins: int = 256,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
         self.bins = int(bins)
         if self.bins < 16:
             raise ValueError("probability histogram requires at least 16 bins")
-        self.positive_histogram = torch.zeros(self.bins, dtype=torch.int64)
-        self.negative_histogram = torch.zeros(self.bins, dtype=torch.int64)
-        self.positive_probability_sum = 0.0
-        self.negative_probability_sum = 0.0
+        self.positive_histogram = torch.zeros(
+            self.bins, dtype=torch.int64, device=device
+        )
+        self.negative_histogram = torch.zeros(
+            self.bins, dtype=torch.int64, device=device
+        )
+        self.positive_probability_sum = torch.zeros(
+            (), dtype=torch.float64, device=device
+        )
+        self.negative_probability_sum = torch.zeros(
+            (), dtype=torch.float64, device=device
+        )
 
     @torch.no_grad()
     def update(
@@ -58,28 +71,46 @@ class BinaryProbabilityMetrics:
         ignore_index: int = 255,
     ) -> None:
         if logits.ndim != 4 or logits.shape[1] != 2 or target.ndim != 3:
-            raise ValueError("binary metrics require logits [B,2,H,W] and target [B,H,W]")
+            raise ValueError(
+                "binary metrics require logits [B,2,H,W] and target [B,H,W]"
+            )
         valid = target != ignore_index
-        if not valid.any():
-            return
         probability = logits.detach().float().softmax(dim=1)[:, 1][valid]
         truth = target[valid] == 1
-        indices = torch.floor(probability * self.bins).long().clamp_(0, self.bins - 1)
+        indices = (
+            torch.floor(probability * self.bins)
+            .long()
+            .clamp_(0, self.bins - 1)
+        )
         for positive, histogram_name, sum_name in (
             (True, "positive_histogram", "positive_probability_sum"),
             (False, "negative_histogram", "negative_probability_sum"),
         ):
-            selected = probability[truth == positive]
-            selected_indices = indices[truth == positive]
-            if not selected_indices.numel():
-                continue
-            counts = torch.bincount(selected_indices, minlength=self.bins).cpu()
-            getattr(self, histogram_name).add_(counts)
-            setattr(self, sum_name, getattr(self, sum_name) + float(selected.sum()))
+            selected_mask = truth == positive
+            selected_indices = indices[selected_mask]
+            counts = torch.bincount(selected_indices, minlength=self.bins)
+            histogram = getattr(self, histogram_name)
+            probability_sum = getattr(self, sum_name)
+            histogram.add_(counts.to(device=histogram.device))
+            probability_sum.add_(
+                probability[selected_mask]
+                .sum()
+                .to(device=probability_sum.device, dtype=torch.float64)
+            )
 
     def compute(self) -> dict[str, float | int]:
-        positive = self.positive_histogram.to(torch.float64)
-        negative = self.negative_histogram.to(torch.float64)
+        # One bounded device-to-host transfer at epoch end replaces per-batch
+        # histogram transfers and scalar synchronizations.
+        histograms = torch.stack(
+            (self.positive_histogram, self.negative_histogram)
+        ).to(device="cpu", dtype=torch.float64)
+        positive, negative = histograms.unbind(0)
+        probability_sums = torch.stack(
+            (self.positive_probability_sum, self.negative_probability_sum)
+        ).cpu()
+        positive_probability_sum, negative_probability_sum = (
+            probability_sums.tolist()
+        )
         positive_count = int(positive.sum())
         negative_count = int(negative.sum())
         if positive_count == 0:
@@ -87,7 +118,7 @@ class BinaryProbabilityMetrics:
                 "probability_histogram_bins": self.bins,
                 "mean_tumor_probability_on_tumor": 0.0,
                 "mean_tumor_probability_on_background": (
-                    self.negative_probability_sum / max(negative_count, 1)
+                    negative_probability_sum / max(negative_count, 1)
                 ),
                 "approx_pr_auc": 0.0,
                 "best_f2_threshold": 1.0,
@@ -120,10 +151,10 @@ class BinaryProbabilityMetrics:
         return {
             "probability_histogram_bins": self.bins,
             "mean_tumor_probability_on_tumor": (
-                self.positive_probability_sum / positive_count
+                positive_probability_sum / positive_count
             ),
             "mean_tumor_probability_on_background": (
-                self.negative_probability_sum / max(negative_count, 1)
+                negative_probability_sum / max(negative_count, 1)
             ),
             "approx_pr_auc": float(approximate_pr_auc),
             "best_f2_threshold": float(thresholds[best_index]),

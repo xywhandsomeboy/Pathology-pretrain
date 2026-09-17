@@ -70,8 +70,36 @@ epochs="${DECODER_EPOCHS:-50}"
 batch_size="${BATCH_SIZE:-16}"
 workers="${DECODER_WORKERS:-8}"
 decoder_drop_path_rate="${DECODER_DROP_PATH_RATE:-0.1}"
+warmup_steps="${WARMUP_STEPS:-20000}"
+decoder_only_steps="${DECODER_ONLY_STEPS:-20000}"
+partial_unfreeze_step="${STAGE1_PARTIAL_UNFREEZE_STEP:-60000}"
+partial_unfreeze_blocks="${STAGE1_PARTIAL_UNFREEZE_BLOCKS:-2}"
+final_unfreeze_step="${STAGE1_FINAL_UNFREEZE_STEP:-100000}"
+final_unfreeze_blocks="${STAGE1_FINAL_UNFREEZE_BLOCKS:-4}"
+checkpoint_interval_steps="${CHECKPOINT_INTERVAL_STEPS:-20000}"
 run_suffix="${RUN_SUFFIX:-}"
 output_dir="${IMPROVED_OUTPUT_ROOT:-${work_root}/decoder_runs_improved}/${profile}/${stage2_variant}/${decoder_version}${run_suffix}"
+
+for name in warmup_steps decoder_only_steps checkpoint_interval_steps; do
+  [[ "${!name}" =~ ^(0|[1-9][0-9]*)$ ]] || {
+    echo "${name} must be a non-negative integer" >&2
+    exit 2
+  }
+done
+for name in partial_unfreeze_step partial_unfreeze_blocks final_unfreeze_step final_unfreeze_blocks; do
+  [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "${name} must be a positive integer" >&2
+    exit 2
+  }
+done
+(( decoder_only_steps < partial_unfreeze_step && partial_unfreeze_step < final_unfreeze_step )) || {
+  echo "Require DECODER_ONLY_STEPS < STAGE1_PARTIAL_UNFREEZE_STEP < STAGE1_FINAL_UNFREEZE_STEP" >&2
+  exit 2
+}
+(( partial_unfreeze_blocks <= final_unfreeze_blocks )) || {
+  echo "STAGE1_PARTIAL_UNFREEZE_BLOCKS cannot exceed STAGE1_FINAL_UNFREEZE_BLOCKS" >&2
+  exit 2
+}
 
 required=(
   "${python_bin}"
@@ -94,6 +122,10 @@ resume_args=()
 if [[ -f "${output_dir}/complete" ]]; then
   echo "Improved run is already complete: ${output_dir}"
   exit 0
+elif [[ -f "${output_dir}/checkpoint_progress.pt" ]] && \
+     { [[ ! -f "${output_dir}/checkpoint_last.pt" ]] || \
+       [[ "${output_dir}/checkpoint_progress.pt" -nt "${output_dir}/checkpoint_last.pt" ]]; }; then
+  resume_args=(--resume "${output_dir}/checkpoint_progress.pt")
 elif [[ -f "${output_dir}/checkpoint_last.pt" ]]; then
   resume_args=(--resume "${output_dir}/checkpoint_last.pt")
 elif [[ -n "$(find "${output_dir}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
@@ -132,11 +164,14 @@ command=(
   --stage1-fusion-lr 1e-5
   --stage1-backbone-lr 2e-6
   --layer-decay 0.8
-  --warmup-ratio 0.1
+  --warmup-steps "${warmup_steps}"
   --min-lr-ratio 0.01
-  --decoder-only-epochs 3
-  --stage1-top-unfreeze-epoch 8
-  --stage1-unfreeze-blocks 4
+  --decoder-only-steps "${decoder_only_steps}"
+  --stage1-partial-unfreeze-step "${partial_unfreeze_step}"
+  --stage1-partial-unfreeze-blocks "${partial_unfreeze_blocks}"
+  --stage1-final-unfreeze-step "${final_unfreeze_step}"
+  --stage1-final-unfreeze-blocks "${final_unfreeze_blocks}"
+  --checkpoint-interval-steps "${checkpoint_interval_steps}"
   --final-phase-pretrained-lr-scale 0.5
   --final-phase-decoder-lr-scale 0.5
   --early-stopping-patience 3

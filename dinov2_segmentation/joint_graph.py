@@ -116,13 +116,17 @@ class JointGraphRepository:
             x = graph.x.index_select(0, subset).to(
                 device=device, dtype=online_node_features.dtype, non_blocking=True
             )
+            provider = getattr(self, "feature_provider", None)
+            if provider is not None and provider.stage != "frozen":
+                x = provider.features(slide_id, [str(graph.patch_ids[i]) for i in subset.tolist()], device)
             batch_tensor = torch.tensor(batch_indices, device=device, dtype=torch.long)
             local_targets = mapping.to(device=device, dtype=torch.long)
-            x = x.index_copy(
-                0,
-                local_targets,
-                online_node_features.index_select(0, batch_tensor),
-            )
+            if provider is None:
+                x = x.index_copy(
+                    0,
+                    local_targets,
+                    online_node_features.index_select(0, batch_tensor),
+                )
             sub_edges = sub_edges.to(device=device, non_blocking=True)
             edge_attr = None
             if use_edge_attr:
@@ -142,7 +146,7 @@ class JointGraphRepository:
             for offset, batch_index in enumerate(batch_indices):
                 contexts[batch_index] = selected[offset]
 
-            if update_memory:
+            if update_memory and provider is None:
                 graph.x.index_copy_(
                     0,
                     node_indices,

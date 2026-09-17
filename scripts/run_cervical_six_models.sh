@@ -31,9 +31,13 @@ v2_batch="${V2_BATCH_SIZE:-16}"
 v1_gpu="${V1_GPU_ID:-0}"
 v2_gpu="${V2_GPU_ID:-1}"
 joint_accumulation="${JOINT_GRADIENT_ACCUMULATION:-1}"
-decoder_only_epochs="${DECODER_ONLY_EPOCHS:-3}"
-stage1_top_unfreeze_epoch="${STAGE1_TOP_UNFREEZE_EPOCH:-8}"
-stage1_unfreeze_blocks="${STAGE1_UNFREEZE_BLOCKS:-4}"
+warmup_steps="${WARMUP_STEPS:-20000}"
+decoder_only_steps="${DECODER_ONLY_STEPS:-20000}"
+stage1_partial_unfreeze_step="${STAGE1_PARTIAL_UNFREEZE_STEP:-60000}"
+stage1_partial_unfreeze_blocks="${STAGE1_PARTIAL_UNFREEZE_BLOCKS:-2}"
+stage1_final_unfreeze_step="${STAGE1_FINAL_UNFREEZE_STEP:-100000}"
+stage1_final_unfreeze_blocks="${STAGE1_FINAL_UNFREEZE_BLOCKS:-4}"
+checkpoint_interval_steps="${CHECKPOINT_INTERVAL_STEPS:-20000}"
 early_stopping_patience="${EARLY_STOPPING_PATIENCE:-3}"
 early_stopping_start_epoch="${EARLY_STOPPING_START_EPOCH:-12}"
 early_stopping_min_delta="${EARLY_STOPPING_MIN_DELTA:-0.001}"
@@ -273,12 +277,20 @@ run_decoder_pair() {
     log "Waiting for independently running decoder: ${variant}/v2"
     sleep "${poll_seconds}"
   done
-  if [[ -f "${v1_output}/checkpoint_last.pt" ]]; then
+  if [[ -f "${v1_output}/checkpoint_progress.pt" ]] && \
+     { [[ ! -f "${v1_output}/checkpoint_last.pt" ]] || \
+       [[ "${v1_output}/checkpoint_progress.pt" -nt "${v1_output}/checkpoint_last.pt" ]]; }; then
+    v1_resume=(--resume "${v1_output}/checkpoint_progress.pt")
+  elif [[ -f "${v1_output}/checkpoint_last.pt" ]]; then
     v1_resume=(--resume "${v1_output}/checkpoint_last.pt")
   elif [[ -n "$(find "${v1_output}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     fail "V1 output is non-empty without a resumable checkpoint: ${v1_output}"
   fi
-  if [[ -f "${v2_output}/checkpoint_last.pt" ]]; then
+  if [[ -f "${v2_output}/checkpoint_progress.pt" ]] && \
+     { [[ ! -f "${v2_output}/checkpoint_last.pt" ]] || \
+       [[ "${v2_output}/checkpoint_progress.pt" -nt "${v2_output}/checkpoint_last.pt" ]]; }; then
+    v2_resume=(--resume "${v2_output}/checkpoint_progress.pt")
+  elif [[ -f "${v2_output}/checkpoint_last.pt" ]]; then
     v2_resume=(--resume "${v2_output}/checkpoint_last.pt")
   elif [[ -n "$(find "${v2_output}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     fail "V2 output is non-empty without a resumable checkpoint: ${v2_output}"
@@ -312,10 +324,13 @@ run_decoder_pair() {
       --gradient-accumulation "${joint_accumulation}" \
       --decoder-lr 1e-4 --stage2-lr 1e-5 \
       --stage1-fusion-lr 1e-5 --stage1-backbone-lr 2e-6 \
-      --layer-decay 0.8 --warmup-ratio 0.1 --min-lr-ratio 0.01 \
-      --decoder-only-epochs "${decoder_only_epochs}" \
-      --stage1-top-unfreeze-epoch "${stage1_top_unfreeze_epoch}" \
-      --stage1-unfreeze-blocks "${stage1_unfreeze_blocks}" \
+      --layer-decay 0.8 --warmup-steps "${warmup_steps}" --min-lr-ratio 0.01 \
+      --decoder-only-steps "${decoder_only_steps}" \
+      --stage1-partial-unfreeze-step "${stage1_partial_unfreeze_step}" \
+      --stage1-partial-unfreeze-blocks "${stage1_partial_unfreeze_blocks}" \
+      --stage1-final-unfreeze-step "${stage1_final_unfreeze_step}" \
+      --stage1-final-unfreeze-blocks "${stage1_final_unfreeze_blocks}" \
+      --checkpoint-interval-steps "${checkpoint_interval_steps}" \
       --final-phase-pretrained-lr-scale 0.5 \
       --final-phase-decoder-lr-scale 0.5 \
       --early-stopping-patience "${early_stopping_patience}" \
@@ -343,10 +358,13 @@ run_decoder_pair() {
       --gradient-accumulation "${joint_accumulation}" \
       --decoder-lr 1e-4 --stage2-lr 1e-5 \
       --stage1-fusion-lr 1e-5 --stage1-backbone-lr 2e-6 \
-      --layer-decay 0.8 --warmup-ratio 0.1 --min-lr-ratio 0.01 \
-      --decoder-only-epochs "${decoder_only_epochs}" \
-      --stage1-top-unfreeze-epoch "${stage1_top_unfreeze_epoch}" \
-      --stage1-unfreeze-blocks "${stage1_unfreeze_blocks}" \
+      --layer-decay 0.8 --warmup-steps "${warmup_steps}" --min-lr-ratio 0.01 \
+      --decoder-only-steps "${decoder_only_steps}" \
+      --stage1-partial-unfreeze-step "${stage1_partial_unfreeze_step}" \
+      --stage1-partial-unfreeze-blocks "${stage1_partial_unfreeze_blocks}" \
+      --stage1-final-unfreeze-step "${stage1_final_unfreeze_step}" \
+      --stage1-final-unfreeze-blocks "${stage1_final_unfreeze_blocks}" \
+      --checkpoint-interval-steps "${checkpoint_interval_steps}" \
       --final-phase-pretrained-lr-scale 0.5 \
       --final-phase-decoder-lr-scale 0.5 \
       --early-stopping-patience "${early_stopping_patience}" \

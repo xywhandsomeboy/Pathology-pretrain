@@ -242,7 +242,8 @@ class TrainableStage1(nn.Module):
         ]
         return torch.cat(crops, dim=0)
 
-    def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def extract_raw(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """DINO outputs before every trainable fusion/aggregation operation."""
         if images.ndim != 4 or images.shape[1] != 3:
             raise ValueError(f"Stage1 images must be [B,3,H,W], got {images.shape}")
         if tuple(images.shape[-2:]) != (self.image_size, self.image_size):
@@ -255,14 +256,21 @@ class TrainableStage1(nn.Module):
         output = self.backbone(images, masks=None, is_training=True)
         cls_feature = output["x_norm_clstoken"]
         dense_tokens = output["x_norm_patchtokens"]
-        global_spatial = self.spatial_agg(dense_tokens.float()).to(cls_feature.dtype)
-
         batch_size = images.size(0)
         local_output = self.backbone(
             self._local_crops(images), masks=None, is_training=True
         )
+        local_tokens = local_output["x_norm_patchtokens"].view(
+            self.num_local_crops, batch_size, -1, self.embed_dim
+        ).transpose(0, 1)
+        return cls_feature, dense_tokens, local_tokens
+
+    def fuse_raw(self, cls_feature, dense_tokens, local_tokens):
+        """Fuse cached or live DINO outputs using the current fusion weights."""
+        batch_size = cls_feature.size(0)
+        global_spatial = self.spatial_agg(dense_tokens.float()).to(cls_feature.dtype)
         local_spatial = self.local_spatial_agg(
-            local_output["x_norm_patchtokens"].float()
+            local_tokens.transpose(0, 1).flatten(0, 1).float()
         ).view(self.num_local_crops, batch_size, -1)
         local_feature = self.local_crop_fusion(local_spatial.float()).to(
             cls_feature.dtype
@@ -270,7 +278,11 @@ class TrainableStage1(nn.Module):
         node_features = self.node_fusion(
             cls_feature, global_spatial, local_feature
         )
-        return node_features, dense_tokens
+        return node_features
+
+    def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        raw = self.extract_raw(images)
+        return self.fuse_raw(*raw), raw[1]
 
 
 @dataclass(frozen=True)
@@ -360,8 +372,24 @@ class JointSegmentationSystem(nn.Module):
                 token_dim=self.stage1.embed_dim,
                 context_dim=self.stage1.embed_dim,
             )
+        elif decoder_version == "v3":
+            from dinov2_segmentation.models.model_v3 import GlobalLocalSegmentationModelV3
+            self.decoder = GlobalLocalSegmentationModelV3(
+                num_classes=num_classes,
+                token_dim=self.stage1.embed_dim,
+                context_dim=self.stage1.embed_dim,
+            )
+        elif decoder_version in ("v4", "v5"):
+            from dinov2_segmentation.models.model_v4 import GlobalLocalSegmentationModelV4
+            from dinov2_segmentation.models.model_v5 import GlobalLocalSegmentationModelV5
+            constructor = (GlobalLocalSegmentationModelV4 if decoder_version == "v4"
+                           else GlobalLocalSegmentationModelV5)
+            options = {"drop_path_rate": decoder_drop_path_rate} if decoder_version == "v4" else {}
+            self.decoder = constructor(num_classes=num_classes,
+                                       token_dim=self.stage1.embed_dim,
+                                       context_dim=self.stage1.embed_dim, **options)
         else:
-            raise ValueError("decoder_version must be 'v1' or 'v2'")
+            raise ValueError("decoder_version must be v1, v2, v3, v4 or v5")
         self.decoder_version = decoder_version
         self.model_version = f"joint_stage1_stage2_decoder_{decoder_version}"
 
@@ -370,5 +398,8 @@ class JointSegmentationSystem(nn.Module):
         images: torch.Tensor,
         dense_tokens: torch.Tensor,
         contexts: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | dict:
+        if self.decoder_version in ("v4", "v5"):
+            return self.decoder(images, dense_tokens, contexts,
+                                return_auxiliary=self.training)
         return self.decoder(images, dense_tokens, contexts)

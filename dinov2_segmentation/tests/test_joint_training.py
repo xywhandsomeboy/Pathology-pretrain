@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from pathlib import Path
 import random
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -13,6 +14,8 @@ import torch
 from torch import nn
 from torch_geometric.data import Data
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "dinov2_stage2_2_FmH2ST"))
+
 from dinov2_segmentation.data.joint_dataset import JointPatchSegmentationDataset
 from dinov2_segmentation.joint_graph import JointGraphRepository
 from dinov2_segmentation.joint_optim import WarmupCosineScheduler, _vit_blocks
@@ -20,8 +23,15 @@ from dinov2_segmentation.losses import (
     foreground_tversky_loss,
     segmentation_loss,
 )
-from dinov2_segmentation.probability_metrics import binary_confusion_metrics
+from dinov2_segmentation.probability_metrics import (
+    BinaryProbabilityMetrics,
+    binary_confusion_metrics,
+)
 from dinov2_segmentation.profiles import validate_experiment_profile
+from dinov2_segmentation.train_joint import (
+    _metrics,
+    _should_collect_probability_metrics,
+)
 
 
 class _TinyGNN(nn.Module):
@@ -72,6 +82,48 @@ class JointTrainingTest(unittest.TestCase):
         self.assertAlmostEqual(result["tumor_specificity"], 8 / 9)
         self.assertAlmostEqual(result["predicted_tumor_fraction"], 1 / 3)
         self.assertAlmostEqual(result["true_tumor_fraction"], 0.4)
+
+    def test_epoch_history_keeps_only_actionable_metrics(self):
+        confusion = torch.tensor([[80, 10], [20, 40]], dtype=torch.int64)
+        probability = torch.tensor([[[0.1, 0.3], [0.7, 0.9]]])
+        target = torch.tensor([[[0, 1], [0, 1]]])
+        two_class = torch.stack((1 - probability, probability), dim=1).log()
+        probability_metrics = BinaryProbabilityMetrics(bins=100)
+        probability_metrics.update(two_class, target)
+        result = _metrics(
+            {
+                "loss": torch.tensor(4.0),
+                "cross_entropy": torch.tensor(2.0),
+                "dice_loss": torch.tensor(2.0),
+            },
+            2,
+            confusion,
+            probability_metrics,
+        )
+        self.assertEqual(
+            set(result),
+            {
+                "loss",
+                "cross_entropy",
+                "dice_loss",
+                "tumor_dice",
+                "tumor_precision",
+                "tumor_recall",
+                "tumor_f2",
+                "predicted_tumor_fraction",
+                "confusion",
+                "approx_pr_auc",
+                "best_f2_threshold",
+                "best_threshold_f2",
+            },
+        )
+
+    def test_probability_metrics_run_every_five_epochs_and_on_final_epoch(self):
+        self.assertFalse(_should_collect_probability_metrics(0, 12))
+        self.assertTrue(_should_collect_probability_metrics(4, 12))
+        self.assertFalse(_should_collect_probability_metrics(5, 12))
+        self.assertTrue(_should_collect_probability_metrics(9, 12))
+        self.assertTrue(_should_collect_probability_metrics(11, 12))
 
     def test_foreground_tversky_emphasizes_false_negatives(self):
         target = torch.tensor([[[1, 0]]], dtype=torch.int64)

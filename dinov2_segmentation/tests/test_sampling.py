@@ -8,6 +8,7 @@ from dinov2_segmentation.sampling import (
     INTERIOR,
     NEGATIVE,
     SlideStratifiedSampler,
+    WSILocalStratifiedSampler,
     patch_stratum,
 )
 
@@ -27,6 +28,8 @@ def _rows() -> list[dict[str, object]]:
                         "patch_id": f"{category}-{slide_index}-{patch_index}",
                         "has_tumor": has_tumor,
                         "tumor_fraction": fraction,
+                        "x": patch_index * 512,
+                        "y": slide_index * 512,
                     }
                 )
     return rows
@@ -81,6 +84,46 @@ class SlideStratifiedSamplerTest(unittest.TestCase):
             patch_stratum(
                 {"slide_id": "s", "has_tumor": 0, "tumor_fraction": 0.2}
             )
+
+    def test_wsi_local_sampler_preserves_population_and_batches(self):
+        rows = _rows()
+        common = dict(
+            num_samples=100,
+            batch_size=10,
+            positive_fraction=0.6,
+            boundary_positive_fraction=0.5,
+            seed=7,
+        )
+        baseline = SlideStratifiedSampler(rows, **common)
+        local = WSILocalStratifiedSampler(
+            rows, **common, locality_tile_size=1024, global_batch_size=20
+        )
+        baseline_indices = list(baseline)
+        local_indices = list(local)
+        self.assertEqual(Counter(local_indices), Counter(baseline_indices))
+        self.assertEqual(local.summary["name"], "wsi_local_stratified_boundary")
+        self.assertEqual(local.summary["locality_tile_size"], 1024)
+        self.assertEqual(local.summary["global_batch_size"], 20)
+        for start in range(0, len(local_indices), 10):
+            batch = local_indices[start : start + 10]
+            self.assertEqual(len(batch), len(set(batch)))
+            self.assertTrue(any(int(rows[index]["has_tumor"]) for index in batch))
+            # Full chunks are one WSI; this tiny fixture deliberately forces
+            # repeat-cap partial chunks, which can pack a few WSIs together.
+            self.assertLessEqual(
+                len({str(rows[index]["slide_id"]) for index in batch}), 4
+            )
+        for start in range(0, len(local_indices), 20):
+            self.assertEqual(
+                len(local_indices[start : start + 20]),
+                len(set(local_indices[start : start + 20])),
+            )
+
+    def test_wsi_local_sampler_requires_coordinates(self):
+        rows = _rows()
+        del rows[0]["x"]
+        with self.assertRaisesRegex(ValueError, "requires integer x and y"):
+            WSILocalStratifiedSampler(rows, num_samples=12, batch_size=4)
 
 
 if __name__ == "__main__":

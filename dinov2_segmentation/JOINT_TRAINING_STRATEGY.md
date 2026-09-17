@@ -34,12 +34,59 @@ ViT-L 的 24 个 Transformer block 从输出到输入按 `0.9` 逐层衰减，�
 所有组由 AdamW 优化，weight decay 为 `0.05`；bias、归一化参数、CLS/mask token 和位置
 嵌入不做 decay。默认使用 BF16、梯度裁剪 `1.0`、micro-batch `1`、梯度累计 `8`。
 
-## 调度与验证
+## 按 optimizer step 渐进解冻（legacy 调度）
 
-- 总更新步的前 5% 线性 warm-up。
-- 之后单周期 cosine 衰减至各组峰值学习率的 1%。
-- scheduler 按 optimizer update 而不是按 epoch 更新，并随 checkpoint 保存/恢复。
-- 损失为 Cross Entropy + soft Dice；最佳模型按验证集肿瘤 Dice 保存，同时记录肿瘤 IoU、
-  pixel accuracy 和混淆矩阵。
-- FiLM 的零初始化会让 Stage2 在第一个更新尚无梯度，因此审计前 10 个 optimizer update；
-  Stage1、Stage2、Decoder 必须在窗口内都出现有限非零梯度，否则训练立即失败。
+下表为保留的 `legacy` 调度。将 GNN、融合模块和 DINO 分开解冻的
+`separate_gnn_fusion` 调度见 [训练流程说明](TRAINING_WORKFLOW.md)。
+
+数据规模扩大后，一个 epoch 约包含 20 万次 optimizer update。继续用“第 3/8 个 epoch”
+作为解冻边界，会让 GATv2 和 DINO 分别等待数百万乃至数千万个 patch 后才开始更新。因此
+新训练使用独立的 `curriculum_step`（即 phase step）控制参数解冻；它只在 optimizer
+update 后递增，不等同于 scheduler 的 `current_step`，并随 checkpoint 保存和恢复。
+
+| `curriculum_step` | 可训练模块 | 目的 |
+|---:|---|---|
+| `0–19,999` | Decoder | 先让随机初始化的分割头对齐预训练特征 |
+| `20,000–59,999` | Decoder + Stage2 GATv2 + Stage1 spatial/local/fusion | 适配图上下文和节点融合，同时保持 ViT 主干稳定 |
+| `60,000–99,999` | 上述模块 + DINO 顶部 2 个 Transformer block | 温和引入高层视觉语义更新 |
+| `>=100,000` | 上述模块 + DINO 顶部 4 个 Transformer block | 进入最终端到端联合微调 |
+
+生产入口对应参数为 `--decoder-only-steps 20000`、
+`--stage1-partial-unfreeze-step 60000 --stage1-partial-unfreeze-blocks 2`、
+`--stage1-final-unfreeze-step 100000 --stage1-final-unfreeze-blocks 4`。这些阈值按全局
+optimizer update 计数，不因串行/DDP 的每进程 batch 表述而改变。
+
+阶段边界发生在 optimizer update 之间，而不是任意 micro-batch 中间。切换阶段时会同时更新
+`requires_grad`、模块 train/eval 模式、参数组学习率缩放，并在 DDP 下按新的可训练参数集合
+安全重建梯度同步包装。没有解冻的 DINO block 继续保持冻结和 eval 状态。
+
+`curriculum_step` 必须独立持久化，不能从 scheduler 步数反推。尤其是旧 S/ST 在完成 epoch 0 后
+已经积累约 20 万个 scheduler step；迁移时若直接把这个数当成解冻进度，会跳过 GATv2
+适配和 DINO 顶部 2 层阶段。旧 epoch-0 checkpoint 因此显式映射为 `curriculum_step=20,000`：
+Decoder 对齐视为完成，随后仍依次执行 40,000 步适配、40,000 步顶部 2 层微调。scheduler
+保留其真实 optimizer 进度而不回退，迁移来源、映射值和学习率切换写入 provenance。
+
+这是一条为保住旧 S/ST 已完成计算而设计的迁移路径；它们经历过旧的 epoch 调度和比例
+warmup，而全新 STA 从 step 0 使用本策略。因此迁移后的 S/ST 与 fresh STA 不再是严格的
+单变量公平对照，报告结果时必须注明。旧运行本身的 epoch 调度记录属于实验历史，不回写
+或改写。
+
+## 学习率、检查点与验证
+
+- 固定前 `20,000` 个 optimizer step 线性 warm-up（`--warmup-steps 20000`），不再使用
+  总训练步数的百分比。这样数据量或 epoch 数变化时，达到峰值学习率所需的实际更新数
+  保持不变。
+- warm-up 后使用单周期 cosine 衰减至各组峰值学习率的 1%。scheduler 仍按 optimizer
+  update 更新，并与独立的 `curriculum_step` 一同保存/恢复。
+- 每 `20,000` 个 optimizer step 保存可恢复的 `checkpoint_progress.pt`
+  （`--checkpoint-interval-steps 20000`）。它包含模型、AdamW、
+  AMP scaler、scheduler、`curriculum_step`、当前 epoch/batch 游标和累计训练统计；串行与
+  DDP 的保存都只发生在完整 optimizer update 边界，可用于同模式续训或受校验的串行到
+  DDP 迁移。
+  sampler 会从保存的 batch 游标确定性重放索引且不读取已经完成的样本，但 worker 内随机增强
+  和在线图缓存不承诺逐位重现，因此恢复后的浮点轨迹可能有轻微差异。
+- 损失为 Cross Entropy + soft Dice；最佳模型按验证集肿瘤 Dice 保存。完整混淆矩阵在设备端
+  累积到 epoch 结束，再统一计算肿瘤 Dice、precision、recall、F2 和预测肿瘤比例。
+- 梯度审计从 GATv2/融合适配阶段开始累计 Stage1、Stage2 和 Decoder 梯度，并在顶部 4 层
+  阶段把 DINO backbone 梯度纳入完成条件；所有值都必须有限且非零，否则在完整联合阶段的
+  审计窗口结束时立即失败。FiLM 零初始化允许梯度在短审计窗口内延迟一个更新出现。

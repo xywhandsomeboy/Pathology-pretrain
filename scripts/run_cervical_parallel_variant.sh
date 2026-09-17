@@ -81,6 +81,13 @@ gradient_accumulation="${GRADIENT_ACCUMULATION:-1}"
 decoder_drop_path_rate="${DECODER_DROP_PATH_RATE:-0.2}"
 max_train_batches="${MAX_TRAIN_BATCHES:-0}"
 max_val_batches="${MAX_VAL_BATCHES:-0}"
+warmup_steps="${WARMUP_STEPS:-20000}"
+decoder_only_steps="${DECODER_ONLY_STEPS:-20000}"
+partial_unfreeze_step="${STAGE1_PARTIAL_UNFREEZE_STEP:-60000}"
+partial_unfreeze_blocks="${STAGE1_PARTIAL_UNFREEZE_BLOCKS:-2}"
+final_unfreeze_step="${STAGE1_FINAL_UNFREEZE_STEP:-100000}"
+final_unfreeze_blocks="${STAGE1_FINAL_UNFREEZE_BLOCKS:-4}"
+checkpoint_interval_steps="${CHECKPOINT_INTERVAL_STEPS:-20000}"
 run_suffix="${RUN_SUFFIX:-_$(date -u +%Y%m%dT%H%M%SZ)_$$}"
 [[ "${run_suffix}" =~ ^_[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || {
   echo "RUN_SUFFIX must start with _ and contain only letters, digits, _, . or -" >&2
@@ -94,14 +101,24 @@ for name in epochs batch_size gradient_accumulation; do
     exit 2
   }
 done
-for name in workers max_train_batches max_val_batches; do
+for name in workers max_train_batches max_val_batches warmup_steps decoder_only_steps checkpoint_interval_steps; do
   [[ "${!name}" =~ ^(0|[1-9][0-9]*)$ ]] || {
     echo "${name} must be a non-negative integer" >&2
     exit 2
   }
 done
-(( epochs > 8 )) || {
-  echo "DECODER_EPOCHS must be at least 9 for the configured unfreezing phases" >&2
+for name in partial_unfreeze_step partial_unfreeze_blocks final_unfreeze_step final_unfreeze_blocks; do
+  [[ "${!name}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "${name} must be a positive integer" >&2
+    exit 2
+  }
+done
+(( decoder_only_steps < partial_unfreeze_step && partial_unfreeze_step < final_unfreeze_step )) || {
+  echo "Require DECODER_ONLY_STEPS < STAGE1_PARTIAL_UNFREEZE_STEP < STAGE1_FINAL_UNFREEZE_STEP" >&2
+  exit 2
+}
+(( partial_unfreeze_blocks <= final_unfreeze_blocks )) || {
+  echo "STAGE1_PARTIAL_UNFREEZE_BLOCKS cannot exceed STAGE1_FINAL_UNFREEZE_BLOCKS" >&2
   exit 2
 }
 [[ -x "${python_bin}" ]] || {
@@ -131,13 +148,27 @@ for path in "${required[@]}"; do
   }
 done
 
-init_args=()
+transfer_args=()
+if [[ -n "${INIT_CHECKPOINT:-}" && -n "${MIGRATE_RESUME:-}" ]]; then
+  echo "INIT_CHECKPOINT and MIGRATE_RESUME are mutually exclusive" >&2
+  exit 2
+fi
 if [[ -n "${INIT_CHECKPOINT:-}" ]]; then
   [[ -s "${INIT_CHECKPOINT}" ]] || {
     echo "Missing or empty INIT_CHECKPOINT: ${INIT_CHECKPOINT}" >&2
     exit 1
   }
-  init_args=(--init-checkpoint "${INIT_CHECKPOINT}")
+  transfer_args=(--init-checkpoint "${INIT_CHECKPOINT}")
+elif [[ -n "${MIGRATE_RESUME:-}" ]]; then
+  [[ "${execution_mode}" == ddp ]] || {
+    echo "MIGRATE_RESUME is only valid when migrating a serial run to ddp" >&2
+    exit 2
+  }
+  [[ -s "${MIGRATE_RESUME}" ]] || {
+    echo "Missing or empty MIGRATE_RESUME: ${MIGRATE_RESUME}" >&2
+    exit 1
+  }
+  transfer_args=(--migrate-resume "${MIGRATE_RESUME}")
 fi
 
 # DRY_RUN is strictly read-only, including no lock/output-directory creation.
@@ -155,9 +186,17 @@ resume_args=()
 if [[ -f "${output_dir}/complete" ]]; then
   echo "Parallel-capable run is already complete: ${output_dir}"
   exit 0
+elif [[ -f "${output_dir}/checkpoint_progress.pt" ]] && \
+     { [[ ! -f "${output_dir}/checkpoint_last.pt" ]] || \
+       [[ "${output_dir}/checkpoint_progress.pt" -nt "${output_dir}/checkpoint_last.pt" ]]; }; then
+  [[ -z "${INIT_CHECKPOINT:-}" && -z "${MIGRATE_RESUME:-}" ]] || {
+    echo "Checkpoint transfer requires a fresh output; this run already has a progress checkpoint" >&2
+    exit 1
+  }
+  resume_args=(--resume "${output_dir}/checkpoint_progress.pt")
 elif [[ -f "${output_dir}/checkpoint_last.pt" ]]; then
-  [[ -z "${INIT_CHECKPOINT:-}" ]] || {
-    echo "INIT_CHECKPOINT requires a fresh output; this run already has a resume checkpoint" >&2
+  [[ -z "${INIT_CHECKPOINT:-}" && -z "${MIGRATE_RESUME:-}" ]] || {
+    echo "Checkpoint transfer requires a fresh output; this run already has a resume checkpoint" >&2
     exit 1
   }
   resume_args=(--resume "${output_dir}/checkpoint_last.pt")
@@ -200,11 +239,14 @@ command+=(
   --stage1-fusion-lr 1e-5
   --stage1-backbone-lr 2e-6
   --layer-decay 0.8
-  --warmup-ratio 0.1
+  --warmup-steps "${warmup_steps}"
   --min-lr-ratio 0.01
-  --decoder-only-epochs 3
-  --stage1-top-unfreeze-epoch 8
-  --stage1-unfreeze-blocks 4
+  --decoder-only-steps "${decoder_only_steps}"
+  --stage1-partial-unfreeze-step "${partial_unfreeze_step}"
+  --stage1-partial-unfreeze-blocks "${partial_unfreeze_blocks}"
+  --stage1-final-unfreeze-step "${final_unfreeze_step}"
+  --stage1-final-unfreeze-blocks "${final_unfreeze_blocks}"
+  --checkpoint-interval-steps "${checkpoint_interval_steps}"
   --final-phase-pretrained-lr-scale 0.5
   --final-phase-decoder-lr-scale 0.5
   --early-stopping-patience 3
@@ -224,7 +266,7 @@ command+=(
   --max-train-batches "${max_train_batches}"
   --max-val-batches "${max_val_batches}"
   "${profile_args[@]}"
-  "${init_args[@]}"
+  "${transfer_args[@]}"
   "${resume_args[@]}"
 )
 

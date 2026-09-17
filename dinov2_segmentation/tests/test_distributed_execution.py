@@ -10,10 +10,12 @@ import torch
 from torch import nn
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch.utils.data import DataLoader, Dataset
 
 from dinov2_segmentation.distributed_execution import (
     DistributedExecution,
     EpochRandomSampler,
+    WholeBatchSampler,
     WholeBatchShardSampler,
 )
 from dinov2_segmentation.probability_metrics import BinaryProbabilityMetrics
@@ -53,6 +55,68 @@ def test_global_epoch_random_order_is_reproducible_and_shuffled():
     assert after != before
     shard.set_epoch(7)
     assert list(shard) == after
+
+
+def test_sharded_batch_resume_uses_rank_local_offset_and_epoch_resets_it():
+    shards = [
+        WholeBatchShardSampler(range(23), 3, rank=rank, world_size=2, training=True)
+        for rank in range(2)
+    ]
+    for shard in shards:
+        shard.set_start_batch(1)
+    assert [len(shard) for shard in shards] == [2, 2]
+    assert list(shards[0]) == [[6, 7, 8], [12, 13, 14]]
+    assert list(shards[1]) == [[9, 10, 11], [15, 16, 17]]
+
+    shards[0].set_start_batch(3)
+    assert len(shards[0]) == 0
+    assert list(shards[0]) == []
+    with pytest.raises(ValueError, match="start_batch"):
+        shards[0].set_start_batch(4)
+    with pytest.raises(ValueError, match="start_batch"):
+        shards[0].set_start_batch(-1)
+
+    shards[0].set_epoch(2)
+    assert len(shards[0]) == 3
+    assert list(shards[0]) == [[0, 1, 2], [6, 7, 8], [12, 13, 14]]
+
+
+class _CountingDataset(Dataset):
+    def __init__(self, size: int) -> None:
+        self.size = int(size)
+        self.visited: list[int] = []
+
+    def __len__(self) -> int:
+        return self.size
+
+    def __getitem__(self, index: int) -> int:
+        self.visited.append(int(index))
+        return int(index)
+
+
+def test_serial_whole_batch_resume_skips_dataset_io_and_keeps_partial_tail():
+    dataset = _CountingDataset(10)
+    batches = WholeBatchSampler(range(len(dataset)), batch_size=4)
+    assert batches.dropped_samples == 0
+    assert len(batches) == 3
+    assert list(batches) == [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9]]
+
+    batches.set_start_batch(1)
+    assert len(batches) == 2
+    assert [batch.tolist() for batch in DataLoader(dataset, batch_sampler=batches)] == [
+        [4, 5, 6, 7],
+        [8, 9],
+    ]
+    assert dataset.visited == [4, 5, 6, 7, 8, 9]
+
+    batches.set_start_batch(3)
+    assert len(batches) == 0
+    assert list(batches) == []
+    with pytest.raises(ValueError, match="start_batch"):
+        batches.set_start_batch(4)
+
+    batches.set_epoch(9)
+    assert len(batches) == 3
 
 
 def test_too_small_training_cohort_fails_instead_of_empty_training():
@@ -201,10 +265,11 @@ def _cpu_rank_worker(rank, directory):
         if rank == 0:
             histograms.positive_histogram[2] = 3
             histograms.negative_histogram[1] = 4
-            histograms.positive_probability_sum = 0.6
-            histograms.negative_probability_sum = 0.4
+            histograms.positive_probability_sum.fill_(0.6)
+            histograms.negative_probability_sum.fill_(0.4)
         reduced = execution.reduce_metrics(
-            {"loss": 6.0 if rank == 0 else 0.0}, 3 if rank == 0 else 0,
+            {"loss": torch.tensor(6.0 if rank == 0 else 0.0)},
+            3 if rank == 0 else 0,
             torch.tensor([[4, 0], [0, 3]]) if rank == 0 else torch.zeros(2, 2, dtype=torch.int64),
             histograms,
         )
@@ -212,7 +277,7 @@ def _cpu_rank_worker(rank, directory):
         assert reduced[2].tolist() == [[4, 0], [0, 3]]
         assert reduced[3].positive_histogram.sum() == 3
         assert reduced[3].negative_histogram.sum() == 4
-        assert reduced[3].positive_probability_sum == pytest.approx(0.6)
+        assert float(reduced[3].positive_probability_sum) == pytest.approx(0.6)
         assert not execution.all_finite(torch.tensor(float("nan") if rank else 1.0))
         assert execution.reduce_max_values({"gradient": rank + 1.0}) == {"gradient": 2.0}
         torch.save({"memory": memory, "parameters": system.state_dict()}, Path(directory, f"rank{rank}.pt"))
